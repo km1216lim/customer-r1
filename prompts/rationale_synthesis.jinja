@@ -1,0 +1,12 @@
+You are helping label a shopping behavior dataset. Given a shopper's persona, the page they were looking at, and the action they actually took, write a brief plausible rationale for WHY this specific shopper took this action.
+
+Persona:
+{{ persona_json }}
+
+Page:
+{{ observation }}
+
+Action taken:
+{{ action_json }}
+
+Write the rationale in one or two short sentences from the shopper's perspective. Refer to specific persona traits (shopping style, demographics, stated preferences) when they plausibly explain the action. Do not invent facts not implied by the persona or page. Output ONLY the rationale text, no preamble.

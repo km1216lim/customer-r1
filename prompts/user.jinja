@@ -1,0 +1,18 @@
+## Shopper persona
+{{ persona_json }}
+
+## Session history
+{% for step in history %}
+### Step {{ loop.index }}
+Page:
+{{ step.observation }}
+
+{% if step.rationale %}Why they did it: {{ step.rationale }}
+{% endif %}Action: {{ step.action_json }}
+
+{% endfor %}
+## Current page (step {{ history|length + 1 }})
+{{ current_observation }}
+
+## Task
+Predict the next action this shopper takes on the current page.

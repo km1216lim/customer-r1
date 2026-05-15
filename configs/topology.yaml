@@ -1,0 +1,80 @@
+defaults:
+  context_length: 65536
+  effective_batch_size: 16
+  per_device_micro_batch: 1
+  sp_size: 4
+  precision: bf16
+  activation_checkpointing: full
+  zero_stage: 3
+  rollout_group_size: 8
+  completion_length: 2048
+
+topologies:
+
+  "4_3b":
+    model_name: Qwen/Qwen2.5-3B-Instruct
+    sp_size: 4
+    dp_size: 1
+    grad_accum: 16
+    rollout:
+      mode: collocated
+      tp_size: 1
+      n_samples: 4
+    notes: |
+      Dev / debug topology. 3B model fits comfortably with SP=4.
+      vLLM rollout runs in same process group via time-slicing.
+
+  "4_7b":
+    model_name: Qwen/Qwen2.5-7B-Instruct
+    sp_size: 4
+    dp_size: 1
+    grad_accum: 16
+    rollout:
+      mode: collocated
+      tp_size: 1
+      n_samples: 4
+    notes: |
+      Experimental only. 7B + 65k on 4 H100 is tight (~70GB peak).
+      Use only for quick smoke tests, not real training.
+
+  "8_7b":
+    model_name: Qwen/Qwen2.5-7B-Instruct
+    sp_size: 4
+    dp_size: 2
+    grad_accum: 8
+    rollout:
+      mode: collocated
+      tp_size: 2
+      n_samples: 8
+    notes: |
+      Main training topology. SP=4 matches Qwen2.5 num_kv_heads.
+      Rollout time-slices with training (verl hybrid engine).
+
+  "16_7b":
+    model_name: Qwen/Qwen2.5-7B-Instruct
+    sp_size: 4
+    dp_size: 4
+    grad_accum: 4
+    rollout:
+      mode: disaggregated
+      rollout_gpus: 8
+      tp_size: 4
+      n_samples: 8
+      weight_sync_every_n_steps: 1
+    notes: |
+      Acceleration topology. 8 GPUs train (DP=4, SP=4), 8 GPUs serve vLLM.
+      NCCL P2P weight broadcast on every GRPO step.
+
+  "16_7b_bs32":
+    model_name: Qwen/Qwen2.5-7B-Instruct
+    sp_size: 4
+    dp_size: 8
+    grad_accum: 4
+    rollout:
+      mode: collocated
+      tp_size: 2
+      n_samples: 8
+    effective_batch_size: 32
+    notes: |
+      Larger batch variant. All 16 GPUs train, rollout time-slices.
+      Use if disaggregated weight sync overhead is too high.
