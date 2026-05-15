@@ -31,5 +31,9 @@ wandb>=0.18.0
 tqdm>=4.66.0
 numpy>=1.26.0
 
+# Eval (rationale quality, optional but used by --rationale_metrics)
+bert-score>=0.3.13
+rouge-score>=0.1.2
+
 # Tests
 pytest>=8.0.0
