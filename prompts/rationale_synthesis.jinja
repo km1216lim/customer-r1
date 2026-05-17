@@ -1,12 +1,48 @@
-You are helping label a shopping behavior dataset. Given a shopper's persona, the page they were looking at, and the action they actually took, write a brief plausible rationale for WHY this specific shopper took this action.
+{# Rationale synthesis prompt — Customer-R1 paper cites Lu et al. (2025a)
+   but does not publish the exact template. This is our reproduction.
 
-Persona:
+   Inputs (Jinja vars):
+     - persona_json:  user.survey JSON string (Demographic / Self Description /
+                      Shopping Preference / Personality sections)
+     - observation:   the current step's simplified_html (potentially truncated
+                      upstream to fit the synthesizer's context budget)
+     - action_wire:   the executed action in paper wire format (e.g. {"type":
+                      "click", "name": "search_result.product_title"})
+     - few_shot_examples (optional): list of {persona_snippet, action_wire,
+                      rationale} drawn from the 164 human-labeled rationales
+                      in OPeRA-filtered train.
+
+   Output: ONLY the rationale string, 1-2 short sentences.
+#}
+You are helping label a shopping-behavior dataset. Given a specific shopper's
+persona, the Amazon page they were looking at, and the action they actually
+took on that page, write a brief plausible rationale for WHY THIS SPECIFIC
+SHOPPER took this action.
+
+Rules:
+- 1 to 2 short sentences, written in the first person from the shopper's
+  perspective.
+- Refer to concrete persona traits (demographics, shopping habits, stated
+  preferences, personality) WHEN they plausibly explain the action.
+- Do NOT invent facts that are not present in the persona or page.
+- Do NOT restate the action verbatim ("I clicked X because I clicked X"); the
+  rationale should explain motivation, not describe behavior.
+- Output ONLY the rationale text. No preamble, no quotation marks, no JSON.
+
+# Shopper persona
 {{ persona_json }}
 
-Page:
+{% if few_shot_examples %}# Real shoppers' rationales (style reference)
+{% for ex in few_shot_examples -%}
+- Persona snippet: {{ ex.persona_snippet }}
+  Action: {{ ex.action_wire }}
+  Rationale: {{ ex.rationale }}
+{% endfor %}
+{% endif %}
+# Current page (HTML)
 {{ observation }}
 
-Action taken:
-{{ action_json }}
+# Action this shopper took on this page
+{{ action_wire }}
 
-Write the rationale in one or two short sentences from the shopper's perspective. Refer to specific persona traits (shopping style, demographics, stated preferences) when they plausibly explain the action. Do not invent facts not implied by the persona or page. Output ONLY the rationale text, no preamble.
+# Rationale (1-2 short sentences, first person, ONLY the rationale text):

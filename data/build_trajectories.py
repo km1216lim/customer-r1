@@ -1,197 +1,208 @@
-"""Build per-step training samples from raw OPeRA sessions.
+"""Build per-session trajectory snapshots from OPeRA-filtered parquet tables.
 
-For each (session, step_t) we produce one sample:
+The Customer-R1 paper formulation: given persona + (obs, action, rationale)
+history, predict the next action. Rather than writing one JSONL row per
+training example (which O(N^2)-duplicates HTML across rows of the same
+session), we emit one row per **session** containing the full ordered list
+of steps. Phase D (tokenize_pack.py) iterates session rows and expands each
+into N training samples, applying the paper's oldest-HTML-drop truncation
+algorithm at that point.
+
+Train/test split: we trust the HuggingFace partition (filtered: 437 train /
+90 test sessions). Users overlap between splits (12 of 15 test users also
+appear in train) — sessions are disjoint, users are not. Customer-R1
+follows this same partition.
+
+Output (default: data/trajectories/{train,test}.jsonl):
 
     {
-        "user_id":     str,
-        "session_id":  str,
-        "step_idx":    int,
-        "persona":     str  (JSON-flattened persona),
-        "history":     list[{observation, rationale?, action_json}],
-        "current_observation": str,
-        "action_gt":   str  (canonical Action.to_json()),
-        "rationale_gt": str | None,  # human-annotated, sparse
+      "user_id": "...",
+      "session_id": "...",
+      "split": "train",
+      "persona": "<survey JSON string from user table>",
+      "steps": [
+        {
+          "step_idx": 0,                          # 0-based, timestamp-sorted
+          "action_id": "...",                     # OPeRA UUID
+          "timestamp": "...",
+          "observation": "<simplified_html as-is>",
+          "action_json": "<Action.to_json() canonical>",
+          "rationale_gt": null                    # human; null if empty
+        },
+        ...
+      ]
     }
-
-The output is JSONL — tokenization and length-bucketing happen in
-tokenize_pack.py so this stage stays cheap and re-runnable.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import random
+import math
+import sys
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Optional
 
-from action_schema import normalize_raw_action, Action
-from parse_html import assign_element_ids, fit_observation
+# Allow running as `python data/build_trajectories.py` from repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from action_schema import normalize_raw_action  # noqa: E402
 
-
-# Per-step character budget when fitting an observation. We size to roughly
-# match the token budget allocated to "current observation" in the prompt.
-# Real budgeting (history truncation) happens in tokenize_pack.py against
-# token counts; this is just a safety net for pathological single pages.
-SINGLE_OBS_CHAR_BUDGET = 120_000  # ~30k tokens for English HTML
+import pandas as pd  # noqa: E402
 
 
-def load_persona(persona_dir: Path, user_id: str) -> dict:
-    p = persona_dir / f"user_{user_id}.json"
-    if not p.exists():
-        return {}
-    return json.loads(p.read_text(encoding="utf-8"))
+def _load_concat(paths: list[Path]) -> pd.DataFrame:
+    if not paths:
+        return pd.DataFrame()
+    return pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
 
 
-def load_rationales(session_dir: Path) -> dict[int, str]:
-    rfile = session_dir / "rationales.json"
-    if not rfile.exists():
-        return {}
-    raw = json.loads(rfile.read_text(encoding="utf-8"))
-    # Expected: list of {step_idx: int, text: str} or dict {step_idx: text}.
-    out: dict[int, str] = {}
-    if isinstance(raw, dict):
-        for k, v in raw.items():
-            out[int(k)] = str(v)
-    else:
-        for r in raw:
-            out[int(r["step_idx"])] = str(r["text"])
-    return out
-
-
-def load_step(step_path: Path, raw_root: Path) -> Optional[dict]:
-    try:
-        step = json.loads(step_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+def _none_if_empty(v: Any) -> Optional[str]:
+    if v is None:
         return None
-    simplified_rel = step.get("simplified_html_path")
-    full_rel = step.get("full_html_path")
-    html = ""
-    if simplified_rel:
-        sp = raw_root / simplified_rel if not Path(simplified_rel).is_absolute() else Path(simplified_rel)
-        if sp.exists():
-            html = sp.read_text(encoding="utf-8", errors="ignore")
-    elif full_rel:
-        fp = raw_root / full_rel if not Path(full_rel).is_absolute() else Path(full_rel)
-        if fp.exists():
-            html = fp.read_text(encoding="utf-8", errors="ignore")
-    if not html:
+    if isinstance(v, float) and math.isnan(v):
         return None
-    html, _ = assign_element_ids(html)
-    html = fit_observation(html, full_html=None, max_chars=SINGLE_OBS_CHAR_BUDGET)
-    try:
-        action = normalize_raw_action(step.get("action") or {})
-    except ValueError:
+    s = str(v)
+    if not s.strip():
         return None
+    return s
+
+
+def build_session_record(
+    session_row: pd.Series,
+    session_actions: pd.DataFrame,
+    persona_json: str,
+    split: str,
+) -> Optional[dict]:
+    """Compose one session JSONL row from its action rows.
+
+    Returns None if the session has zero parseable actions; otherwise emits a
+    dict containing every action in timestamp order. We refuse to silently
+    drop unparseable actions mid-session — that would shift step indices in a
+    way that breaks history alignment with what the human actually saw — so a
+    schema-violation skips the whole session.
+    """
+    rows = session_actions.sort_values("timestamp").reset_index(drop=True)
+    if len(rows) == 0:
+        return None
+
+    steps: list[dict] = []
+    for i, row in rows.iterrows():
+        raw = row.to_dict()
+        try:
+            action = normalize_raw_action(raw)
+        except ValueError:
+            return None
+        html = raw.get("simplified_html")
+        if html is None or (isinstance(html, float) and math.isnan(html)):
+            html = ""
+        steps.append({
+            "step_idx": int(i),
+            "action_id": str(raw["action_id"]),
+            "timestamp": str(raw["timestamp"]),
+            "observation": str(html),
+            # action_json: internal/GT-side. Carries click_type for reward weighting.
+            "action_json": action.to_json(),
+            # action_wire_json: paper Appendix B wire format. Used in user prompt
+            # for history rendering so the model sees the same shape it must emit.
+            "action_wire_json": action.to_wire_json(),
+            "rationale_gt": _none_if_empty(raw.get("rationale")),
+        })
+
     return {
-        "step_idx": int(step.get("step_idx", -1)),
-        "observation": html,
-        "action": action,
+        "user_id": str(session_row["user_id"]),
+        "session_id": str(session_row["session_id"]),
+        "split": split,
+        "persona": persona_json,
+        "steps": steps,
     }
 
 
-def iter_sessions(raw_root: Path) -> Iterable[Path]:
-    yield from sorted((raw_root / "sessions").glob("user_*/session_*"))
+def build_split(raw_root: Path, variant: str, split: str, out_path: Path) -> dict:
+    base = raw_root / f"OPeRA_{variant}"
+    actions = _load_concat(sorted((base / "action").glob(f"{split}-*.parquet")))
+    sessions = _load_concat(sorted((base / "session" / split).glob("*.parquet")))
+    users = _load_concat(sorted((base / "user" / split).glob("*.parquet")))
 
+    if not len(actions):
+        raise FileNotFoundError(f"No action parquet under {base}/action/{split}-*.parquet")
+    if not len(sessions):
+        raise FileNotFoundError(f"No session parquet under {base}/session/{split}/")
+    if not len(users):
+        raise FileNotFoundError(f"No user parquet under {base}/user/{split}/")
 
-def build_samples_for_session(
-    session_dir: Path,
-    raw_root: Path,
-    persona_dir: Path,
-) -> list[dict]:
-    user_id = session_dir.parent.name.replace("user_", "")
-    session_id = session_dir.name.replace("session_", "")
-    persona = load_persona(persona_dir, user_id)
-    rationales = load_rationales(session_dir)
+    persona_by_user = {str(r["user_id"]): str(r["survey"]) for _, r in users.iterrows()}
 
-    step_paths = sorted((session_dir / "steps").glob("*.json"))
-    loaded: list[dict] = []
-    for sp in step_paths:
-        s = load_step(sp, raw_root)
-        if s is not None:
-            loaded.append(s)
-    if len(loaded) < 2:
-        return []
+    # Pre-group actions by session_id for O(1) lookup instead of N filter scans.
+    actions_by_session: dict[str, pd.DataFrame] = {
+        sid: sub for sid, sub in actions.groupby("session_id")
+    }
 
-    samples: list[dict] = []
-    for t in range(1, len(loaded)):
-        history = []
-        for prev in loaded[:t]:
-            history.append({
-                "step_idx": prev["step_idx"],
-                "observation": prev["observation"],
-                "rationale": rationales.get(prev["step_idx"]),
-                "action_json": prev["action"].to_json(),
-            })
-        sample = {
-            "user_id": user_id,
-            "session_id": session_id,
-            "step_idx": loaded[t]["step_idx"],
-            "persona": json.dumps(persona, ensure_ascii=False, sort_keys=True),
-            "history": history,
-            "current_observation": loaded[t]["observation"],
-            "action_gt": loaded[t]["action"].to_json(),
-            "rationale_gt": rationales.get(loaded[t]["step_idx"]),
-        }
-        samples.append(sample)
-    return samples
+    n_sessions_written = 0
+    n_sessions_skipped = 0
+    n_steps = 0
+    n_rationale_nonempty = 0
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        for _, sess in sessions.iterrows():
+            sid = str(sess["session_id"])
+            sa = actions_by_session.get(sid)
+            if sa is None or len(sa) == 0:
+                n_sessions_skipped += 1
+                continue
+            persona_json = persona_by_user.get(str(sess["user_id"]), "{}")
+            record = build_session_record(sess, sa, persona_json, split)
+            if record is None:
+                n_sessions_skipped += 1
+                continue
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            n_sessions_written += 1
+            n_steps += len(record["steps"])
+            n_rationale_nonempty += sum(1 for s in record["steps"] if s["rationale_gt"])
 
-def make_split_by_user(user_ids: list[str], seed: int = 42) -> dict[str, str]:
-    """Leak-free split: each user goes entirely into train / val / test."""
-    rng = random.Random(seed)
-    shuffled = sorted(user_ids)
-    rng.shuffle(shuffled)
-    n = len(shuffled)
-    n_val = max(1, n // 10)
-    n_test = max(1, n // 10)
-    split = {}
-    for i, u in enumerate(shuffled):
-        if i < n_val:
-            split[u] = "val"
-        elif i < n_val + n_test:
-            split[u] = "test"
-        else:
-            split[u] = "train"
-    return split
+    return {
+        "split": split,
+        "out": str(out_path),
+        "sessions_written": n_sessions_written,
+        "sessions_skipped": n_sessions_skipped,
+        "training_samples": n_steps,
+        "rationale_nonempty": n_rationale_nonempty,
+        "rationale_fraction": (
+            round(n_rationale_nonempty / n_steps, 4) if n_steps else 0.0
+        ),
+    }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--raw_root", type=Path, default=Path("data/raw"))
-    ap.add_argument("--out_dir", type=Path, default=Path("data/trajectories"))
-    ap.add_argument("--seed", type=int, default=42)
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument(
+        "--raw_root",
+        type=Path,
+        default=Path.home() / "Documents/DATA/opera",
+        help="Root containing OPeRA_{variant}/ (default: ~/Documents/DATA/opera)",
+    )
+    ap.add_argument("--variant", choices=["filtered", "full"], default="filtered")
+    ap.add_argument(
+        "--out_dir",
+        type=Path,
+        default=Path("data/trajectories"),
+        help="Output directory for {split}.jsonl files (default: data/trajectories)",
+    )
+    ap.add_argument(
+        "--splits",
+        nargs="+",
+        default=["train", "test"],
+        help="Splits to build (default: train test)",
+    )
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    persona_dir = args.raw_root / "personas"
+    summary: dict = {"variant": args.variant, "raw_root": str(args.raw_root)}
+    for split in args.splits:
+        out_path = args.out_dir / f"{split}.jsonl"
+        summary[split] = build_split(args.raw_root, args.variant, split, out_path)
 
-    sessions_by_user: dict[str, list[Path]] = {}
-    for sess in iter_sessions(args.raw_root):
-        uid = sess.parent.name.replace("user_", "")
-        sessions_by_user.setdefault(uid, []).append(sess)
-
-    split = make_split_by_user(list(sessions_by_user.keys()), seed=args.seed)
-    print(f"[split] {sum(1 for v in split.values() if v=='train')} train / "
-          f"{sum(1 for v in split.values() if v=='val')} val / "
-          f"{sum(1 for v in split.values() if v=='test')} test users")
-
-    files = {s: (args.out_dir / f"{s}.jsonl").open("w", encoding="utf-8") for s in ("train", "val", "test")}
-    counts = {s: 0 for s in ("train", "val", "test")}
-
-    try:
-        for uid, sessions in sessions_by_user.items():
-            s = split[uid]
-            for sess in sessions:
-                for sample in build_samples_for_session(sess, args.raw_root, persona_dir):
-                    files[s].write(json.dumps(sample, ensure_ascii=False) + "\n")
-                    counts[s] += 1
-    finally:
-        for f in files.values():
-            f.close()
-
-    print(json.dumps({"samples": counts}, indent=2))
-    (args.out_dir / "split.json").write_text(json.dumps(split, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

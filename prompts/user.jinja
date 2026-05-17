@@ -2,17 +2,19 @@
 {{ persona_json }}
 
 ## Session history
-{% for step in history %}
+{% for step in history -%}
 ### Step {{ loop.index }}
-Page:
+Page (HTML):
 {{ step.observation }}
 
-{% if step.rationale %}Why they did it: {{ step.rationale }}
-{% endif %}Action: {{ step.action_json }}
+{% if step.rationale %}Why: {{ step.rationale }}
+{% endif %}Action: {{ step.action_wire_json }}
 
 {% endfor %}
 ## Current page (step {{ history|length + 1 }})
 {{ current_observation }}
 
 ## Task
-Predict the next action this shopper takes on the current page.
+Predict the immediate next action this shopper takes on the current page.
+Return a SINGLE JSON object with keys "rationale" and "action", matching the
+output format specified in the system message. No prose, no code fences.

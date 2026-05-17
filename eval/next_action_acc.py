@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "data"))
-from action_schema import Action, parse_model_action  # noqa: E402
+from action_schema import Action, action_from_dict, parse_model_output  # noqa: E402
 
 
 # -------------------------------------------------------------------------
@@ -40,15 +40,28 @@ from action_schema import Action, parse_model_action  # noqa: E402
 # -------------------------------------------------------------------------
 
 def per_step_metrics(pred: Optional[Action], gt: Action) -> dict[str, int]:
+    """Counts {format_valid, type_acc, fg_type_acc, nag} for one (pred, gt) pair.
+
+    fg_type_acc (fine-grained type): action type matches AND every required
+    attribute slot is filled. For our 3 action types that means:
+      - click:     pred.semantic_id is not None
+      - input:     pred.semantic_id is not None AND pred.input_text is not None
+      - terminate: always true if type matches
+    nag (next action gen): the full match per Action.matches.
+    """
     out = {"format_valid": 0, "type_acc": 0, "fg_type_acc": 0, "nag": 0}
     if pred is None:
         return out
     out["format_valid"] = 1
     if pred.type == gt.type:
         out["type_acc"] = 1
-        same_target_presence = (pred.target_id is None) == (gt.target_id is None)
-        same_value_presence  = (pred.value is None) == (gt.value is None)
-        if same_target_presence and same_value_presence:
+        if pred.type == "click":
+            slots_ok = pred.semantic_id is not None
+        elif pred.type == "input":
+            slots_ok = pred.semantic_id is not None and pred.input_text is not None
+        else:  # terminate
+            slots_ok = True
+        if slots_ok:
             out["fg_type_acc"] = 1
             if pred.matches(gt):
                 out["nag"] = 1
@@ -88,16 +101,33 @@ def macro_f1(pred_types: list[str], gt_types: list[str]) -> tuple[float, dict[st
 # Session outcome F1 (purchase vs not)
 # -------------------------------------------------------------------------
 
-def session_outcome_f1(sessions: dict[tuple, dict]) -> tuple[float, dict]:
+def session_outcome_f1(
+    sessions: dict[tuple, dict],
+    name_to_click_type: Optional[dict[str, str]] = None,
+) -> tuple[float, dict]:
     """Binary F1 (purchase as the positive class) over sessions.
+
+    A session "purchases" iff its last action is click+click_type==purchase.
+
+    On the GT side, gt.click_type is populated from the dataset row. On the
+    prediction side, the model's wire output does not carry click_type, so we
+    look it up from the predicted semantic_id via `name_to_click_type` (built
+    from the union of train+test action rows; see build_trajectories.py).
+    Unknown semantic_ids in pred → treated as not-purchase.
 
     sessions: {(user_id, session_id): {"pred_last": Action|None, "gt_last": Action}}
     """
+    name_to_click_type = name_to_click_type or {}
     tp = fp = fn = tn = 0
-    for sid, rec in sessions.items():
-        gt_pos = rec["gt_last"].type == "purchase"
-        pred_action = rec["pred_last"]
-        pred_pos = pred_action is not None and pred_action.type == "purchase"
+    for _, rec in sessions.items():
+        gt = rec["gt_last"]
+        gt_pos = gt.type == "click" and gt.click_type == "purchase"
+        pred = rec["pred_last"]
+        if pred is not None and pred.type == "click":
+            pred_ct = pred.click_type or name_to_click_type.get(pred.semantic_id or "")
+            pred_pos = pred_ct == "purchase"
+        else:
+            pred_pos = False
         if gt_pos and pred_pos: tp += 1
         elif pred_pos and not gt_pos: fp += 1
         elif gt_pos and not pred_pos: fn += 1
@@ -117,9 +147,16 @@ def session_outcome_f1(sessions: dict[tuple, dict]) -> tuple[float, dict]:
 # -------------------------------------------------------------------------
 
 def extract_rationale(text: str) -> Optional[str]:
-    import re
-    m = re.search(r"<rationale>(.*?)</rationale>", text, re.DOTALL | re.IGNORECASE)
-    return m.group(1).strip() if m else None
+    """Pull the rationale string from a paper-format completion.
+
+    Wire format (Appendix B) is a single JSON `{"rationale": ..., "action": ...}`,
+    so rationale comes from `parse_model_output` rather than tag regex.
+    """
+    parsed = parse_model_output(text)
+    if parsed is None:
+        return None
+    rationale = parsed[0].strip()
+    return rationale if rationale else None
 
 
 def rationale_metrics(preds: list[Optional[str]], refs: list[Optional[str]]) -> dict:
@@ -158,11 +195,12 @@ def rationale_metrics(preds: list[Optional[str]], refs: list[Optional[str]]) -> 
 # -------------------------------------------------------------------------
 
 def parse_gt(d: dict) -> Action:
-    return Action(
-        type=str(d["type"]).lower(),
-        target_id=int(d["target_id"]) if d.get("target_id") is not None else None,
-        value=str(d["value"]) if d.get("value") is not None else None,
-    )
+    """Build the GT Action from the internal dict stored as action_gt JSON.
+
+    Internal dict shape (from action_schema.Action.to_dict, paper Appendix B
+    plus our click_type metadata): {"type": "...", "click_type": "...", "name": "...", "text": "..."}.
+    """
+    return action_from_dict(d)
 
 
 def main() -> None:
@@ -179,9 +217,15 @@ def main() -> None:
     with args.predictions.open("r", encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
-            r["pred_action"] = parse_model_action(r["completion"])
-            r["gt_action"]   = parse_gt(json.loads(r["action_gt"]))
-            r["pred_rationale"] = extract_rationale(r["completion"])
+            parsed = parse_model_output(r["completion"])
+            if parsed is None:
+                r["pred_action"] = None
+                r["pred_rationale"] = None
+            else:
+                pred_rationale, pred_action = parsed
+                r["pred_action"] = pred_action
+                r["pred_rationale"] = pred_rationale.strip() or None
+            r["gt_action"] = parse_gt(json.loads(r["action_gt"]))
             rows.append(r)
 
     # --- per-step metrics ----------------------------------------------------
