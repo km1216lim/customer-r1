@@ -1,8 +1,10 @@
 stage: grpo
 
 data:
-  train_path: data/processed/grpo_train.parquet
-  val_path: data/processed/grpo_val.parquet
+  # Same parquet as SFT — GRPO uses prompt_text for rollout and action_gt
+  # (canonical internal JSON with click_type) for the verifiable reward.
+  train_path: data/processed/train.parquet
+  val_path: data/processed/test.parquet
   packed: false
   bucket_lengths: [16384, 32768, 65536]
 
@@ -20,6 +22,8 @@ ref_model:
   freeze: true
 
 grpo:
+  # KL/clip/group_size NOT specified in the Customer-R1 paper — defaults below
+  # are standard GRPO values used in DeepSeek-R1 reproductions. Tune later.
   kl_coef: 0.001
   clip_range: 0.2
   group_size: 8
@@ -27,20 +31,28 @@ grpo:
   rollout_top_p: 1.0
   reward_normalization: group_std
   loss_type: dr_grpo
-  format_reward_weight: 0.1
 
 train:
-  total_steps: 2000
+  # Customer-R1 paper §4.3: 2 epochs over the train split with batch size 64.
+  num_epochs: 2
+  batch_size: 64
   save_every_n_steps: 100
   eval_every_n_steps: 100
   log_every_n_steps: 5
   seed: 42
 
 reward:
-  type: action_correctness
-  action_type_weight: 1.0
-  attribute_match_weight: 1.0
-  format_bonus: 0.1
+  # Customer-R1 difficulty-aware weights (paper §3.2).
+  # See train/reward.py:RewardConfig — these fields map 1:1.
+  input_weight: 2000.0
+  hard_click_weight: 1000.0
+  product_option_weight: 10.0
+  review_search_weight: 1.0
+  terminate_weight: 1.0
+  wrong_click_penalty: -1.0        # SFT+RL setting; flip to 0 for RL-only via `rl_only: true`
+  wrong_non_click_weight: 0.0      # unspecified by paper; default 0
+  format_bonus: 0.1                # paper says "binary"; magnitude is our choice
+  rl_only: false                   # set true to reproduce the RL-only ablation row
 
 checkpoint:
   save_format: hf_safetensors

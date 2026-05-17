@@ -1,0 +1,33 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Local Python venv
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Data artifacts (large; recreated by data/ scripts)
+data/trajectories/
+data/trajectories_synth/
+data/processed/
+data/stats/
+data/raw/
+
+# Model checkpoints (huge)
+ckpt/
+checkpoints/
+runs/
+wandb/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

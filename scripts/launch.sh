@@ -36,16 +36,27 @@ if [[ -n "$VARIANT" ]]; then
   TOPO_KEY="${TOPO_KEY}_${VARIANT}"
 fi
 
-NNODES=$(( (GPUS + 7) / 8 ))
-NPROC_PER_NODE=$(( GPUS < 8 ? GPUS : 8 ))
+# --- topology layout ----------------------------------------------------
+# Default assumes 8-GPU-per-node clusters: 16 GPUs → 2 nodes × 8.
+# Override NNODES / NPROC_PER_NODE for single-node 16-GPU boxes (DGX H100,
+# NVSwitch) or for any non-default layout.
+#   single 16-GPU node:    NNODES=1 NPROC_PER_NODE=16 bash scripts/launch.sh --gpus 16 ...
+#   2 nodes × 8 GPU:       (default) NNODES=2 NPROC_PER_NODE=8 on each node, NODE_RANK=0/1
+NNODES_AUTO=$(( (GPUS + 7) / 8 ))
+NNODES=${NNODES:-$NNODES_AUTO}
+NPROC_PER_NODE_AUTO=$(( GPUS / NNODES ))
+NPROC_PER_NODE=${NPROC_PER_NODE:-$NPROC_PER_NODE_AUTO}
 
-export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}
+# --- NCCL --------------------------------------------------------------
+export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}        # 0 → use InfiniBand if available
+export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-""}  # set in cluster, e.g. "ib0" or "eth0"
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export TORCH_NCCL_USE_COMM_NONBLOCKING=1
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
 
-# Multi-node rendezvous. Override via MASTER_ADDR / NODE_RANK in cluster.
+# --- rendezvous --------------------------------------------------------
+# Multi-node: export MASTER_ADDR (head node IP), NODE_RANK (0..NNODES-1) on each node.
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-29500}
 NODE_RANK=${NODE_RANK:-0}

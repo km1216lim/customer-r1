@@ -6,9 +6,17 @@ Reads the topology config to set up:
   - bf16 mixed precision, ZeRO-3, full activation checkpointing
 
 Data:
-  data/processed/sft_{train,val}.parquet  (from tokenize_pack.py)
+  data/processed/{train,test}.parquet  (from data/tokenize_pack.py)
+  Columns: prompt_text (chat-templated, ends at the assistant generation
+  prompt) and completion_text (single-JSON paper format). verl tokenizes
+  on the fly via its dataset preprocessor — we don't store input_ids here.
 
-Loss: standard next-token CE on completion_ids, masking the prompt portion.
+Loss: standard next-token CE on the completion span, with the prompt span
+masked to -100. The model's tokenizer is `topo.model_name`.
+
+NOTE: The exact verl trainer keyword names below (total_epochs vs
+total_training_steps, prompt_key, pre_tokenized) vary across verl versions.
+Verify against the verl revision pinned for your cluster.
 """
 
 from __future__ import annotations
@@ -43,10 +51,12 @@ def main() -> None:
             "val_files":   base["data"]["val_path"],
             "max_length":  topo.context_length,
             "micro_batch_size_per_gpu": topo.per_device_micro_batch,
-            "train_batch_size": topo.effective_batch_size,
-            "prompt_key":     "prompt_ids",
-            "response_key":   "completion_ids",
-            "pre_tokenized":  True,
+            "train_batch_size": base["train"]["batch_size"],
+            # Text columns from data/tokenize_pack.py — verl tokenizes per-batch
+            # using the model's tokenizer (topo.model_name) inside its dataset.
+            "prompt_key":     "prompt_text",
+            "response_key":   "completion_text",
+            "pre_tokenized":  False,
         },
         "model": {
             "partial_pretrain": topo.model_name,
@@ -63,7 +73,10 @@ def main() -> None:
         "optim": base["optim"],
         "trainer": {
             "default_local_dir": str(args.output_dir),
-            "total_epochs": base["train"]["num_epochs"],
+            # Paper uses step-based budget (2000 steps, batch 64). Some verl
+            # versions key on total_epochs instead; the SFT entrypoint should
+            # be updated to whichever the pinned verl revision expects.
+            "total_training_steps": base["train"]["total_steps"],
             "logger": "wandb" if base["logging"]["use_wandb"] else "console",
             "project_name": base["logging"]["project"],
             "experiment_name": f"{base['logging']['run_name_prefix']}-{topo.key}",

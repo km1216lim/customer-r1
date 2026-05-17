@@ -25,7 +25,7 @@ topologies:
       vLLM rollout runs in same process group via time-slicing.
 
   "4_7b":
-    model_name: Qwen/Qwen2.5-7B-Instruct
+    model_name: Qwen/Qwen2.5-7B-Instruct-1M
     sp_size: 4
     dp_size: 1
     grad_accum: 16
@@ -38,7 +38,7 @@ topologies:
       Use only for quick smoke tests, not real training.
 
   "8_7b":
-    model_name: Qwen/Qwen2.5-7B-Instruct
+    model_name: Qwen/Qwen2.5-7B-Instruct-1M
     sp_size: 4
     dp_size: 2
     grad_accum: 8
@@ -51,7 +51,7 @@ topologies:
       Rollout time-slices with training (verl hybrid engine).
 
   "16_7b":
-    model_name: Qwen/Qwen2.5-7B-Instruct
+    model_name: Qwen/Qwen2.5-7B-Instruct-1M
     sp_size: 4
     dp_size: 4
     grad_accum: 4
@@ -66,7 +66,7 @@ topologies:
       NCCL P2P weight broadcast on every GRPO step.
 
   "16_7b_bs32":
-    model_name: Qwen/Qwen2.5-7B-Instruct
+    model_name: Qwen/Qwen2.5-7B-Instruct-1M
     sp_size: 4
     dp_size: 8
     grad_accum: 4

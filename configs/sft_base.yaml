@@ -1,21 +1,26 @@
 stage: sft
 
 data:
-  train_path: data/processed/sft_train.parquet
-  val_path: data/processed/sft_val.parquet
+  # Outputs of data/tokenize_pack.py (stage-agnostic: single parquet per split).
+  # The dataloader masks prompt_text and computes loss only on completion_text + im_end.
+  train_path: data/processed/train.parquet
+  val_path: data/processed/test.parquet
   packed: true
   bucket_lengths: [8192, 16384, 32768, 65536]
 
 optim:
+  # Customer-R1 paper (arxiv 2510.07230) §4.3: lr=1e-5, AdamW, warmup 150 steps.
   lr: 1.0e-5
   weight_decay: 0.0
-  warmup_ratio: 0.03
+  warmup_steps: 150
   lr_scheduler: cosine
   optimizer: adamw_torch
   max_grad_norm: 1.0
 
 train:
-  num_epochs: 2
+  # Customer-R1 paper §4.3: 2000 total steps with batch size 64.
+  total_steps: 2000
+  batch_size: 64
   save_every_n_steps: 200
   eval_every_n_steps: 200
   log_every_n_steps: 10
