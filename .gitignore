@@ -4,6 +4,10 @@
 !.env.example
 *.key
 *.pem
+# Google Cloud service-account keys
+.gcp/
+gcp-*.json
+service-account*.json
 
 # Local Python venv
 .venv/
