@@ -43,7 +43,9 @@ import json
 import os
 import random
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -175,6 +177,99 @@ def append_cache(cache_path: Path, entry: dict) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+# --- concurrency helpers --------------------------------------------------
+
+class RateLimiter:
+    """Thread-safe global RPM throttle. wait() blocks until the next slot."""
+
+    def __init__(self, rpm: float) -> None:
+        self.interval = 60.0 / rpm if rpm and rpm > 0 else 0.0
+        self.lock = threading.Lock()
+        self.next_time = 0.0
+
+    def wait(self) -> None:
+        if self.interval <= 0:
+            return
+        with self.lock:
+            now = time.time()
+            sleep_for = self.next_time - now
+            if sleep_for > 0:
+                # Hold the lock while sleeping so other threads serialize properly.
+                time.sleep(sleep_for)
+                now = time.time()
+            self.next_time = max(now, self.next_time) + self.interval
+
+
+def _process_one_action(
+    task: tuple[str, dict, int],
+    client,
+    template,
+    few_shot: list[dict],
+    model: str,
+    max_observation_chars: int,
+    max_retries: int,
+    limiter: RateLimiter,
+    cache: dict,
+    cache_lock: threading.Lock,
+    cache_path: Path,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Run one action through synthesize_one with retries; write to cache.
+
+    Returns (entry, None) on success or (None, last_error_str) on giveup.
+    Cache append + in-memory cache update are serialized under cache_lock.
+    """
+    split, session, step_idx = task
+    step = session["steps"][step_idx]
+    action_id = step["action_id"]
+
+    attempt = 0
+    rationale: Optional[str] = None
+    last_err: Optional[Exception] = None
+    while attempt < max_retries:
+        if attempt == 0:
+            limiter.wait()
+        try:
+            rationale = synthesize_one(
+                client, template,
+                session["persona"], step["observation"], step["action_wire_json"],
+                few_shot_examples=few_shot,
+                model=model,
+                max_observation_chars=max_observation_chars,
+            )
+            if rationale:
+                break
+            last_err = RuntimeError("empty response")
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            if "429" in msg or "rate" in msg or "quota" in msg or "resource_exhausted" in msg:
+                backoff = 60.0 * (2 ** attempt) + random.uniform(0, 5)
+            else:
+                backoff = 5.0 * (2 ** attempt) + random.uniform(0, 2)
+            time.sleep(backoff)
+        attempt += 1
+
+    if not rationale:
+        return None, (str(last_err) if last_err else "unknown")
+
+    entry = {
+        "action_id": action_id,
+        "session_id": session["session_id"],
+        "step_idx": int(step_idx),
+        "split": split,
+        "model": model,
+        "rationale": rationale,
+    }
+    with cache_lock:
+        # Re-check inside the lock — another worker may have raced and already
+        # written this action_id (rare but possible if iter_pending yields a
+        # session twice across splits, or on retry+reprocess).
+        if action_id not in cache:
+            append_cache(cache_path, entry)
+            cache[action_id] = entry
+    return entry, None
+
+
 # --- iterate steps needing synthesis --------------------------------------
 
 def iter_pending(
@@ -287,6 +382,14 @@ def main() -> None:
         default=5,
         help="Retries per API call before giving up on a single action.",
     )
+    ap.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of parallel API workers. 1 = sequential (default). 4-8 typically "
+             "cuts wall time substantially when latency dominates (gemini-2.5-flash). "
+             "Higher values risk 429s and proxy connection limits.",
+    )
     args = ap.parse_args()
 
     load_env(args.dotenv)
@@ -315,87 +418,101 @@ def main() -> None:
     )
     print(f"[synth] few-shot examples loaded: {len(few_shot)} (k={args.few_shot_k})", flush=True)
 
-    pending = list(iter_pending(args.traj_dir, args.splits, cache))
-    print(f"[synth] {len(pending)} steps need synthesis", flush=True)
+    # Stream pending steps via the generator — materializing the full list
+    # holds every session dict (including all simplified_html) in RAM at once,
+    # which OOMs on ≤8GB machines (max session ≈14MB × 437 ≈ multi-GB).
+    print(
+        f"[synth] streaming pending steps; concurrency={args.concurrency}, rpm={args.rpm}",
+        flush=True,
+    )
     if args.limit is not None:
         print(f"[synth] limit={args.limit} (will stop after that many new calls)", flush=True)
 
-    interval = 60.0 / args.rpm if args.rpm > 0 else 0.0
-    t_last = 0.0
-    n_calls = 0
-    n_errors = 0
-    n_giveup = 0
+    limiter = RateLimiter(args.rpm)
+    cache_lock = threading.Lock()
+    counter_lock = threading.Lock()
+    counters = {"calls": 0, "errors": 0, "giveup": 0}
     t_start = time.time()
 
-    for split, session, step_idx in pending:
-        if args.limit is not None and n_calls >= args.limit:
-            break
-        step = session["steps"][step_idx]
-        action_id = step["action_id"]
+    def _on_complete(entry: Optional[dict], err: Optional[str], split: str, action_id: str) -> None:
+        with counter_lock:
+            if entry is not None:
+                counters["calls"] += 1
+                n = counters["calls"]
+            else:
+                counters["errors"] += 1
+                counters["giveup"] += 1
+                n = counters["calls"]
+            errors = counters["errors"]
 
-        attempt = 0
-        rationale: Optional[str] = None
-        last_err: Optional[Exception] = None
-        while attempt < args.max_retries:
-            # Throttle only on the first attempt of each action.
-            if attempt == 0:
-                wait = interval - (time.time() - t_last)
-                if wait > 0:
-                    time.sleep(wait)
-                t_last = time.time()
-            try:
-                rationale = synthesize_one(
-                    client, template,
-                    session["persona"], step["observation"], step["action_wire_json"],
-                    few_shot_examples=few_shot,
-                    model=args.model,
-                    max_observation_chars=args.max_observation_chars,
-                )
-                if rationale:
-                    break
-                last_err = RuntimeError("empty response")
-            except Exception as e:
-                last_err = e
-                msg = str(e).lower()
-                if "429" in msg or "rate" in msg or "quota" in msg or "resource_exhausted" in msg:
-                    backoff = 60.0 * (2 ** attempt) + random.uniform(0, 5)
-                else:
-                    backoff = 5.0 * (2 ** attempt) + random.uniform(0, 2)
-                print(
-                    f"  [retry {attempt+1}/{args.max_retries}] {type(e).__name__}: "
-                    f"{str(e)[:120]}  sleeping {backoff:.0f}s",
-                    flush=True,
-                )
-                time.sleep(backoff)
-            attempt += 1
+        if entry is None:
+            print(f"  [gave up] action_id={action_id}: {err}", flush=True)
 
-        if not rationale:
-            n_giveup += 1
-            n_errors += 1
-            print(f"  [gave up] action_id={action_id} after {args.max_retries} attempts: {last_err}", flush=True)
-            continue
-
-        entry = {
-            "action_id": action_id,
-            "session_id": session["session_id"],
-            "step_idx": int(step_idx),
-            "split": split,
-            "model": args.model,
-            "rationale": rationale,
-        }
-        append_cache(cache_path, entry)
-        cache[action_id] = entry
-        n_calls += 1
-
-        if n_calls % 25 == 0:
+        if n and n % 25 == 0:
             elapsed = time.time() - t_start
-            rpm_eff = n_calls / (elapsed / 60.0) if elapsed > 0 else 0.0
+            rpm_eff = n / (elapsed / 60.0) if elapsed > 0 else 0.0
+            with cache_lock:
+                total = len(cache)
             print(
-                f"  [{split}] synthesized {n_calls} new (cache total {len(cache)}, "
-                f"errors {n_errors}, eff {rpm_eff:.1f} RPM)",
+                f"  [{split}] synthesized {n} new (cache total {total}, "
+                f"errors {errors}, eff {rpm_eff:.1f} RPM)",
                 flush=True,
             )
 
+    if args.concurrency <= 1:
+        # Sequential path — preserved for debug / minimal-memory runs.
+        for split, session, step_idx in iter_pending(args.traj_dir, args.splits, cache):
+            with counter_lock:
+                if args.limit is not None and counters["calls"] >= args.limit:
+                    break
+            step = session["steps"][step_idx]
+            entry, err = _process_one_action(
+                (split, session, step_idx),
+                client, template, few_shot,
+                args.model, args.max_observation_chars, args.max_retries,
+                limiter, cache, cache_lock, cache_path,
+            )
+            _on_complete(entry, err, split, step["action_id"])
+    else:
+        # Bounded-parallel path. We cap in-flight tasks at `concurrency * 2`
+        # via a Semaphore: the producer thread (iter_pending consumer) blocks
+        # before submitting more, so we never materialize the entire
+        # `pending` list (which would hold every session dict in RAM).
+        in_flight = threading.Semaphore(args.concurrency * 2)
+        stop_event = threading.Event()
+
+        def _release(_f) -> None:
+            in_flight.release()
+
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            for split, session, step_idx in iter_pending(args.traj_dir, args.splits, cache):
+                with counter_lock:
+                    if args.limit is not None and counters["calls"] >= args.limit:
+                        stop_event.set()
+                if stop_event.is_set():
+                    break
+                in_flight.acquire()
+                action_id = session["steps"][step_idx]["action_id"]
+                fut = pool.submit(
+                    _process_one_action,
+                    (split, session, step_idx),
+                    client, template, few_shot,
+                    args.model, args.max_observation_chars, args.max_retries,
+                    limiter, cache, cache_lock, cache_path,
+                )
+                fut.add_done_callback(_release)
+                # Block on the result here would defeat parallelism; instead
+                # use a separate callback to update counters when each task
+                # finishes. We close over (split, action_id) so the print
+                # carries the right context.
+                fut.add_done_callback(
+                    (lambda s, aid: lambda f: _on_complete(*f.result(), s, aid))(split, action_id)
+                )
+            # Implicit pool shutdown(wait=True) on context exit drains all tasks.
+
+    n_calls = counters["calls"]
+    n_errors = counters["errors"]
+    n_giveup = counters["giveup"]
     print(
         f"[synth] done. {n_calls} new, {n_errors} errors, {n_giveup} gave up. "
         f"cache total: {len(cache)}",

@@ -15,7 +15,8 @@ ray[default]>=2.35.0
 
 # Data
 datasets>=3.0.0
-pyarrow>=17.0.0
+pyarrow>=17.0.0,<18.0.0
+pandas>=2.0.0
 huggingface_hub>=0.25.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0

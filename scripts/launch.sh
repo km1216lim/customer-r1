@@ -7,6 +7,15 @@
 #   bash scripts/launch.sh --gpus 8  --model 7b --stage grpo
 #   bash scripts/launch.sh --gpus 16 --model 7b --stage grpo
 #   bash scripts/launch.sh --gpus 16 --model 7b --stage grpo --variant bs32
+#
+# Compression variant selection (data side):
+#   --data baseline   → configs/{stage}_base.yaml (default; data/processed/)
+#   --data l2         → configs/{stage}_l2.yaml   (data/processed_L2/)
+#
+# Examples (server, H100 8GPU single node):
+#   bash scripts/launch.sh --gpus 8 --model 7b --stage sft                # baseline SFT
+#   bash scripts/launch.sh --gpus 8 --model 7b --stage sft  --data l2     # L2 SFT
+#   bash scripts/launch.sh --gpus 8 --model 7b --stage grpo --data l2     # L2 GRPO
 
 set -euo pipefail
 
@@ -14,6 +23,7 @@ GPUS=""
 MODEL=""
 STAGE=""
 VARIANT=""
+DATA=""
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -22,18 +32,37 @@ while [[ $# -gt 0 ]]; do
     --model)   MODEL="$2"; shift 2 ;;
     --stage)   STAGE="$2"; shift 2 ;;
     --variant) VARIANT="$2"; shift 2 ;;
+    --data)    DATA="$2"; shift 2 ;;
     *)         EXTRA_ARGS+=("$1"); shift ;;
   esac
 done
 
 if [[ -z "$GPUS" || -z "$MODEL" || -z "$STAGE" ]]; then
-  echo "Usage: $0 --gpus {4|8|16} --model {3b|7b} --stage {sft|grpo} [--variant <suffix>]" >&2
+  echo "Usage: $0 --gpus {4|8|16} --model {3b|7b} --stage {sft|grpo} [--variant <suffix>] [--data {baseline|l2}]" >&2
   exit 1
 fi
 
 TOPO_KEY="${GPUS}_${MODEL}"
 if [[ -n "$VARIANT" ]]; then
   TOPO_KEY="${TOPO_KEY}_${VARIANT}"
+fi
+
+# --- data variant: pick the right base yaml ---------------------------
+# Default = "_base" (paper baseline, data/processed/).
+# Other names map to configs/{stage}_{name}.yaml — currently only "l2"
+# is shipped (data/processed_L2/). Add new yamls for other variants.
+DATA_LC="${DATA,,}"
+if [[ -z "$DATA_LC" || "$DATA_LC" == "baseline" ]]; then
+  CONFIG_NAME="${STAGE}_base"
+else
+  CONFIG_NAME="${STAGE}_${DATA_LC}"
+fi
+CONFIG_PATH="configs/${CONFIG_NAME}.yaml"
+
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  echo "[error] base config not found: $CONFIG_PATH" >&2
+  echo "  available stage configs: $(ls configs/${STAGE}_*.yaml 2>/dev/null | xargs -n1 basename)" >&2
+  exit 1
 fi
 
 # --- topology layout ----------------------------------------------------
@@ -61,7 +90,7 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-29500}
 NODE_RANK=${NODE_RANK:-0}
 
-echo "[launch] topology=${TOPO_KEY} stage=${STAGE} nnodes=${NNODES} nproc/node=${NPROC_PER_NODE}"
+echo "[launch] topology=${TOPO_KEY} stage=${STAGE} config=${CONFIG_PATH} nnodes=${NNODES} nproc/node=${NPROC_PER_NODE}"
 
 torchrun \
   --nnodes="${NNODES}" \
@@ -72,5 +101,5 @@ torchrun \
   "train/${STAGE}.py" \
   --topology "${TOPO_KEY}" \
   --topology_config configs/topology.yaml \
-  --base_config "configs/${STAGE}_base.yaml" \
+  --base_config "${CONFIG_PATH}" \
   "${EXTRA_ARGS[@]}"

@@ -257,6 +257,70 @@ saving:                       40.5%
 
 **결론: 압축 연구는 진행할 가치 있음.** L1+L2의 실제 학습 비교에서 next-action accuracy가 baseline과 같거나 우위면, "같은 GPU 자원으로 더 많은 history 입력 → 페이퍼 baseline 우위" 명제가 성립한다.
 
+### 3.7 — 변형별 실측 토큰 통계 (Phase 3 결과)
+
+> 측정 방법: 전체 trajectories_synth (train 437 sessions / 4,864 samples,
+> test 90 sessions / 992 samples)에 대해 `tokenize_pack_compressed.py`로
+> Qwen2.5-7B-Instruct-1M 토크나이저로 전수 토큰화한 실측치. 예측 아님.
+> 출처 manifest: `data/processed*/manifest.json`.
+
+#### Train split (4,864 samples)
+
+| 지표 | **baseline** | **L1** | **L2** | **L1L2** |
+|---|---|---|---|---|
+| mean prompt tokens | 42,865 | 43,482 (+617) | **40,184** (−2,681) | 41,356 (−1,509) |
+| max prompt tokens (post-fix) | 65,000 | 65,000 | 64,998 | 65,000 |
+| **mean history dropped (steps)** | **16.16** | 16.12 | **6.28** (−61%) | 7.15 (−56%) |
+| samples with current_truncated | 1,658 (34.1%) | 1,658 | 1,658 | 1,658 |
+| furniture pieces (총) | 0 | 715 | **0** | 715 |
+| furniture chars / session (mean) | 0 | 7,903 | **0** | 7,903 |
+| 처리 시간 (train) | 28 min | 32 min | 72 min | 69 min |
+
+#### Test split (992 samples)
+
+| 지표 | baseline | L1 | **L2** | L1L2 |
+|---|---|---|---|---|
+| mean prompt tokens | 43,306 | 44,005 | **40,186** | 41,103 |
+| mean history dropped (steps) | 8.93 | 8.90 | **2.68** | 3.46 |
+| furniture chars / session | 0 | 3,474 | 0 | 3,474 |
+
+#### 핵심 결론
+
+1. **L2 단독이 가장 우수.** 모든 지표에서 다른 변형을 앞섬:
+   - mean prompt 40,184 (baseline 대비 −6.3%, L1L2 대비 −2.8%)
+   - mean history dropped 6.28 (baseline 16.16 대비 **−61% 감소**)
+   - furniture overhead 0
+
+2. **L1+L2가 L2 단독보다 못함.** L1+L2의 mean prompt(41,356)가 L2 단독
+   (40,184)보다 **+1,172 토큰 더 큼**. furniture 정의 섹션의 추가 비용이
+   furniture 압축 효과를 상쇄하는 정도가 아니라 **순손실**임을 정량 확인.
+   같은 이유로 L1L2의 mean_history_dropped(7.15)가 L2 단독(6.28)보다 큼 —
+   furniture overhead 때문에 더 많은 history HTML을 omit해야 함.
+
+3. **L1 단독은 의미 없음.** mean prompt가 baseline 대비 오히려 +617 토큰
+   상승. history dropped도 거의 동일(16.16 vs 16.12). 학습 비교 후순위.
+
+4. **paper baseline의 정보 손실이 크다.** 평균 16개 history step의 HTML이
+   `[omitted]` 마커로 통째로 사라진 상태로 학습 중. L2는 6.28개만 omit →
+   평균 약 10개 step의 페이지 정보가 추가로 살아남음. **압축 가설 강하게 검증**.
+
+5. **max prompt tokens fix.** 초기 생성 시 일부 sample이 79,334 토큰까지
+   over budget이었음 (`fit_prompt_for_step`의 fallback이 1000 chars 하한에서
+   멈춤). hard token-level cap 추가 후 모든 sample이 65K 이내로 들어옴.
+
+#### 다음 학습 비교의 메인 변형
+
+| 변형 | 학습 가치 | 권장 |
+|---|---|---|
+| **baseline** | paper 재현 + 비교 기준 | 필수 |
+| **L2** | **압축 가설 검증 메인** (가장 강한 신호) | 필수 |
+| L1L2 | L2 vs L1L2 비교로 L1의 (음의) 기여 정량화 | ablation, 후순위 |
+| L1 | 효과 미미하여 학습 가치 낮음 | 비권장 |
+
+**메인 학습 비교: `baseline vs L2`** — 가설 검증에 가장 적합. 같은 65K budget에서
+L2가 baseline 대비 9.88 step 더 많은 history 정보를 보존하므로, next-action
+accuracy가 같거나 우위면 "압축으로 더 많은 context → 페이퍼 baseline 우위" 명제 성립.
+
 ## 4. Information Loss & 평가 방법
 
 평가 메트릭 두 축:
@@ -312,6 +376,10 @@ data/
 │   ├── test.parquet
 │   └── manifest.json
 ├── processed_L1/              # Layer 1 (furniture dedup)
+│   ├── train.parquet
+│   ├── test.parquet
+│   └── manifest.json
+├── processed_L2/              # Layer 2 only (action-anchored, no furniture)
 │   ├── train.parquet
 │   ├── test.parquet
 │   └── manifest.json

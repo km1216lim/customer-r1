@@ -48,12 +48,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from action_schema import normalize_raw_action  # noqa: E402
 
 import pandas as pd  # noqa: E402
+import pyarrow.parquet as pq  # noqa: E402
 
 
 def _load_concat(paths: list[Path]) -> pd.DataFrame:
     if not paths:
         return pd.DataFrame()
     return pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
+
+
+# Action parquets carry the simplified_html column which is large enough that
+# materializing the full action table in memory (via pd.read_parquet) peaks at
+# multi-GB on OPeRA-filtered train. On low-RAM machines (≤8GB) this OOMs in
+# pyarrow before pandas even sees the table. Stream by row group, keep only
+# the columns build_session_record needs, and scatter into a per-session dict.
+_ACTION_COLS = [
+    "session_id", "action_id", "timestamp",
+    "action_type", "click_type", "semantic_id",
+    "simplified_html", "rationale", "input_text",
+]
+
+
+def _load_actions_by_session(paths: list[Path], batch_size: int = 256) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for p in paths:
+        pf = pq.ParquetFile(p)
+        for batch in pf.iter_batches(batch_size=batch_size, columns=_ACTION_COLS):
+            for row in batch.to_pylist():
+                sid = row.get("session_id")
+                if sid is None:
+                    continue
+                out.setdefault(str(sid), []).append(row)
+    return out
 
 
 def _none_if_empty(v: Any) -> Optional[str]:
@@ -119,12 +145,12 @@ def build_session_record(
 
 def build_split(raw_root: Path, variant: str, split: str, out_path: Path) -> dict:
     base = raw_root / f"OPeRA_{variant}"
-    actions = _load_concat(sorted((base / "action").glob(f"{split}-*.parquet")))
+    action_paths = sorted((base / "action").glob(f"{split}-*.parquet"))
+    if not action_paths:
+        raise FileNotFoundError(f"No action parquet under {base}/action/{split}-*.parquet")
     sessions = _load_concat(sorted((base / "session" / split).glob("*.parquet")))
     users = _load_concat(sorted((base / "user" / split).glob("*.parquet")))
 
-    if not len(actions):
-        raise FileNotFoundError(f"No action parquet under {base}/action/{split}-*.parquet")
     if not len(sessions):
         raise FileNotFoundError(f"No session parquet under {base}/session/{split}/")
     if not len(users):
@@ -132,10 +158,9 @@ def build_split(raw_root: Path, variant: str, split: str, out_path: Path) -> dic
 
     persona_by_user = {str(r["user_id"]): str(r["survey"]) for _, r in users.iterrows()}
 
-    # Pre-group actions by session_id for O(1) lookup instead of N filter scans.
-    actions_by_session: dict[str, pd.DataFrame] = {
-        sid: sub for sid, sub in actions.groupby("session_id")
-    }
+    # Stream action parquets by row group to avoid materializing the full
+    # simplified_html column (multi-GB on OPeRA-filtered train) in RAM.
+    actions_by_session: dict[str, list[dict]] = _load_actions_by_session(action_paths)
 
     n_sessions_written = 0
     n_sessions_skipped = 0
@@ -146,12 +171,17 @@ def build_split(raw_root: Path, variant: str, split: str, out_path: Path) -> dic
     with out_path.open("w", encoding="utf-8") as f:
         for _, sess in sessions.iterrows():
             sid = str(sess["session_id"])
-            sa = actions_by_session.get(sid)
-            if sa is None or len(sa) == 0:
+            rows = actions_by_session.get(sid)
+            if not rows:
                 n_sessions_skipped += 1
                 continue
+            sa = pd.DataFrame(rows)
             persona_json = persona_by_user.get(str(sess["user_id"]), "{}")
             record = build_session_record(sess, sa, persona_json, split)
+            # Free per-session HTML payload as soon as we're done with it so
+            # peak memory stays roughly O(largest session) rather than O(split).
+            del actions_by_session[sid]
+            del sa
             if record is None:
                 n_sessions_skipped += 1
                 continue
