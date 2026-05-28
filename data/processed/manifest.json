@@ -1,0 +1,50 @@
+{
+  "compression": "none",
+  "params": {
+    "l1_min_len": 200,
+    "l1_max_pieces": 8,
+    "l2_window": 600
+  },
+  "generator": {
+    "script": "data/tokenize_pack_compressed.py",
+    "git_sha": "f9ff9588a75d",
+    "tokenizer": "Qwen/Qwen2.5-7B-Instruct-1M",
+    "max_prompt_tokens": 65000,
+    "created_utc": "2026-05-27T03:18:35Z"
+  },
+  "input": {
+    "trajectories_synth": "data\\trajectories_synth"
+  },
+  "splits": {
+    "train": {
+      "out": "data\\processed\\train.parquet",
+      "sessions": 437,
+      "samples": 4864,
+      "samples_with_current_truncated": 1658,
+      "mean_history_dropped_per_sample": 16.16,
+      "mean_prompt_tokens": 42865.4,
+      "max_prompt_tokens": 65000,
+      "rationale_human": 164,
+      "rationale_synthetic": 4700,
+      "furniture_pieces_total": 0,
+      "furniture_chars_total": 0,
+      "furniture_chars_per_session_mean": 0.0,
+      "elapsed_seconds": 1696.8
+    },
+    "test": {
+      "out": "data\\processed\\test.parquet",
+      "sessions": 90,
+      "samples": 992,
+      "samples_with_current_truncated": 332,
+      "mean_history_dropped_per_sample": 8.93,
+      "mean_prompt_tokens": 43305.5,
+      "max_prompt_tokens": 64998,
+      "rationale_human": 43,
+      "rationale_synthetic": 949,
+      "furniture_pieces_total": 0,
+      "furniture_chars_total": 0,
+      "furniture_chars_per_session_mean": 0.0,
+      "elapsed_seconds": 315.0
+    }
+  }
+}
