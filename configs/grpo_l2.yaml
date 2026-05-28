@@ -55,4 +55,4 @@ checkpoint:
 logging:
   project: customer-r1
   run_name_prefix: grpo-l2
-  use_wandb: true
+  use_wandb: false
