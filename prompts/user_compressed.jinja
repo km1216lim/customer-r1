@@ -1,0 +1,29 @@
+## Shopper persona
+{{ persona_json }}
+
+{% if furniture %}## Page furniture (used across this shopping session)
+The pages in this session reuse the chrome below. Wherever you see [[F1]],
+[[F2]], ... inside any HTML below, expand it using the same-numbered block
+in this section. These do not change across steps.
+{% for piece in furniture -%}
+[[F{{ loop.index }}]] =
+{{ piece }}
+{% endfor %}
+{% endif %}
+## Session history
+{% for step in history -%}
+### Step {{ loop.index }}
+Page (HTML):
+{{ step.observation }}
+
+{% if step.rationale %}Why: {{ step.rationale }}
+{% endif %}Action: {{ step.action_wire_json }}
+
+{% endfor %}
+## Current page (step {{ history|length + 1 }})
+{{ current_observation }}
+
+## Task
+Predict the immediate next action this shopper takes on the current page.
+Return a SINGLE JSON object with keys "rationale" and "action", matching the
+output format specified in the system message. No prose, no code fences.

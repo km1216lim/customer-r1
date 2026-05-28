@@ -17,12 +17,18 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# Data artifacts (large; recreated by data/ scripts)
+# Data artifacts: raw + intermediate JSONL are large and recreated by data/
+# scripts; the final processed_* parquets are tracked for git-clone-and-train
+# workflows on the server.
 data/trajectories/
 data/trajectories_synth/
-data/processed/
 data/stats/
 data/raw/
+
+# Smoke / temporary outputs from tokenize_pack_compressed
+data/_smoke_*
+data/_temp_*
+data/redundancy_*
 
 # Model checkpoints (huge)
 ckpt/
@@ -30,8 +36,9 @@ checkpoints/
 runs/
 wandb/
 
-# OS / editor
+# OS / editor / IDE assistant
 .DS_Store
 .idea/
 .vscode/
+.claude/
 *.swp

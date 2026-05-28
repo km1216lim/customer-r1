@@ -1,0 +1,58 @@
+stage: grpo
+
+data:
+  # Layer-2 compressed dataset. Actor / ref init from L2 SFT checkpoint.
+  train_path: data/processed_L2/train.parquet
+  val_path: data/processed_L2/test.parquet
+  packed: false
+  bucket_lengths: [16384, 32768, 65536]
+
+actor:
+  init_from_ckpt: ckpt/sft-l2/latest_hf
+  lr: 5.0e-7
+  weight_decay: 0.0
+  warmup_steps: 100
+  lr_scheduler: constant
+  optimizer: adamw_torch
+  max_grad_norm: 1.0
+
+ref_model:
+  init_from_ckpt: ckpt/sft-l2/latest_hf
+  freeze: true
+
+grpo:
+  kl_coef: 0.001
+  clip_range: 0.2
+  group_size: 8
+  rollout_temperature: 1.0
+  rollout_top_p: 1.0
+  reward_normalization: group_std
+  loss_type: dr_grpo
+
+train:
+  num_epochs: 2
+  batch_size: 64
+  save_every_n_steps: 100
+  eval_every_n_steps: 100
+  log_every_n_steps: 5
+  seed: 42
+
+reward:
+  input_weight: 2000.0
+  hard_click_weight: 1000.0
+  product_option_weight: 10.0
+  review_search_weight: 1.0
+  terminate_weight: 1.0
+  wrong_click_penalty: -1.0
+  wrong_non_click_weight: 0.0
+  format_bonus: 0.1
+  rl_only: false
+
+checkpoint:
+  save_format: hf_safetensors
+  save_optimizer_state: false
+
+logging:
+  project: customer-r1
+  run_name_prefix: grpo-l2
+  use_wandb: true
