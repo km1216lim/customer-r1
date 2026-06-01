@@ -1,21 +1,51 @@
-# Core training
-torch>=2.4.0
-transformers>=4.45.0
+# Customer-R1 pinned dependencies.
+#
+# These versions are verified to train Qwen2.5-7B-Instruct-1M with SFT + GRPO
+# on a Linux H100 8GPU cluster (CUDA 12.2 driver). See docs/training.md for
+# the full server install procedure — `pip install -r requirements.txt` is
+# necessary but NOT sufficient (flash-attn, verl, NCCL pins need special
+# steps).
+#
+# Pinned for: Python 3.10 · CUDA 12.1 torch wheels · NVIDIA driver >= 535.x
+#
+# Update process: bump these in lockstep — torch / vllm / transformers /
+# flash-attn / verl share ABI/API surface and individual upgrades break the
+# stack. See docs/training.md §7 trouble-shooting for what each pin guards.
+
+# --- Core training (server) ---
+# torch 2.4.0+cu121 is the only combo that works with the stack below.
+# DO NOT install via plain `pip install torch>=...` — pip will pull
+# torch 2.11+cu130, which the cluster driver (CUDA 12.2) cannot run.
+# Install via: pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+torch==2.4.0
+transformers==4.46.3
 accelerate>=1.0.0
 deepspeed>=0.15.0
-flash-attn>=2.6.0
+# flash-attn is installed from a pre-built wheel matching
+# torch 2.4 + cu12.x + cp310 + abiFALSE. See docs/training.md §3 step 4
+# for the exact wheel URL. DO NOT add flash-attn as a name here — pip
+# would source-build it (slow + ABI-fragile).
 
-# RL framework (pick one; verl is the primary path)
-verl>=0.3.0
-# openrlhf>=0.5.0  # alternative
+# --- RL framework ---
+# verl 0.4.1 must be installed with --no-deps to avoid torch downgrade.
+# DO NOT pin verl as a regular requirement — install separately:
+#   pip install verl==0.4.1 --no-deps
+# These are verl's runtime deps that we install manually:
+omegaconf>=2.3.0
+hydra-core>=1.3.0
+tensordict>=0.5.0
+codetiming>=1.4.0
+dill>=0.3.8
 
-# Rollout
-vllm>=0.6.3
+# --- Rollout (used by GRPO + eval inference) ---
+vllm==0.6.3
 ray[default]>=2.35.0
 
-# Data
+# --- Data pipeline ---
 datasets>=3.0.0
-pyarrow>=17.0.0,<18.0.0
+# pyarrow: verl 0.4.1 requires >=19.0.0. Tokenized parquets under
+# data/processed* were generated with pyarrow 17 but are forward-compatible.
+pyarrow>=19.0.0
 pandas>=2.0.0
 huggingface_hub>=0.25.0
 beautifulsoup4>=4.12.0
@@ -23,7 +53,7 @@ lxml>=5.0.0
 jinja2>=3.1.0
 PyYAML>=6.0.0
 
-# Rationale synthesis (Vertex AI Gemini 2.5 Pro; service-account auth via google-auth)
+# --- Rationale synthesis (Phase 2; Vertex AI Gemini 2.5) ---
 google-genai>=0.3.0
 google-auth>=2.34.0
 python-dotenv>=1.0.0
@@ -31,14 +61,23 @@ python-dotenv>=1.0.0
 anthropic>=0.40.0
 openai>=1.50.0
 
-# Logging
+# --- Logging ---
 wandb>=0.18.0
 tqdm>=4.66.0
-numpy>=1.26.0
+numpy>=1.26.0,<2.0.0
 
-# Eval (rationale quality, optional but used by --rationale_metrics)
+# --- Evaluation (Phase 6 rationale quality; required by --rationale_metrics) ---
 bert-score>=0.3.13
 rouge-score>=0.1.2
 
-# Tests
+# --- Tests ---
 pytest>=8.0.0
+
+# --- NCCL pin (server-side critical) ---
+# nvidia-nccl-cu12 must NOT be left at "latest". torch 2.4 + vllm pulls
+# nvidia-nccl-cu13 (2.28.9) transitively, which the cluster driver
+# (CUDA 12.2) cannot run, AND it overwrites the cu12 .so file. See
+# docs/training.md §3 step 7 for the install-time pin via:
+#   pip uninstall -y nvidia-nccl-cu13
+#   pip install --force-reinstall --no-deps nvidia-nccl-cu12==2.20.5
+# (Cannot pin here because pip's transitive resolution overrides.)
