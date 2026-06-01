@@ -92,6 +92,26 @@ def main() -> None:
     import verl.trainer.fsdp_sft_trainer as sft_mod
     from verl.trainer.fsdp_sft_trainer import run_sft
 
+    # --- verl 0.4.1 fsdp2_clip_grad_norm_ replacement ---------------------
+    # The torch 2.4 -> 2.5 shim above (which patches torch.nn.utils.clip_grad)
+    # works when the shimmed import is exercised at lookup time, but verl's
+    # fsdp_sft_trainer binds `fsdp2_clip_grad_norm_` AT MODULE LOAD via
+    # `from verl.utils.fsdp_utils import fsdp2_clip_grad_norm_`. The trainer
+    # then calls the original verl function, whose internal
+    # `from torch.nn.utils.clip_grad import clip_grads_with_norm_, ...` line
+    # fires on every step regardless of our shim and crashes on torch 2.4.
+    # Replace the verl function object directly in both modules with a
+    # torch 2.4-native equivalent (torch.nn.utils.clip_grad.clip_grad_norm_,
+    # which has the same effect — compute total norm and rescale grads).
+    import torch.nn.utils.clip_grad as _clip_grad_mod
+    import verl.utils.fsdp_utils as _verl_fsdp_utils
+
+    def _customer_r1_fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0):
+        return _clip_grad_mod.clip_grad_norm_(parameters, max_norm, norm_type)
+
+    _verl_fsdp_utils.fsdp2_clip_grad_norm_ = _customer_r1_fsdp2_clip_grad_norm_
+    sft_mod.fsdp2_clip_grad_norm_ = _customer_r1_fsdp2_clip_grad_norm_
+
     # Load verl's bundled base config so version-specific defaults stay intact.
     verl_yaml = Path(sft_mod.__file__).parent / "config" / "sft_trainer.yaml"
     cfg = OmegaConf.load(str(verl_yaml))
