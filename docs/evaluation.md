@@ -19,6 +19,43 @@ eval/preds_sft-l2.results.json + console table
 
 Two stages: **infer** (slow, GPU) and **score** (fast, CPU only).
 
+## One-line cluster job (recommended)
+
+On clusters that only accept a single bash invocation per job, use the
+bundled launchers — they auto-resolve the latest checkpoint, run inference
+through vLLM, and score Table 4 metrics in sequence.
+
+```bash
+# evaluate one variant (auto-finds latest ckpt/{stage}{,-l2}/global_step_N/actor)
+bash scripts/eval.sh --stage sft  --data baseline                # SFT baseline
+bash scripts/eval.sh --stage sft  --data l2                      # SFT L2
+bash scripts/eval.sh --stage grpo --data l2  --tp_size 4         # GRPO L2, 4 GPUs
+
+# pin to a specific checkpoint step
+bash scripts/eval.sh --stage sft  --data l2  --step 1000
+
+# skip BERTScore/ROUGE-L for speed
+bash scripts/eval.sh --stage sft  --data l2  --no_rationale_metrics
+
+# rescore existing predictions JSONL without re-running inference
+bash scripts/eval.sh --stage sft  --data l2  --skip_inference
+
+# evaluate baseline + L2 sequentially in one job
+bash scripts/eval_all.sh --stage sft
+bash scripts/eval_all.sh --stage grpo --tp_size 4
+```
+
+`scripts/eval.sh` paths it picks per `--data` value:
+
+| `--data` | model | data | preds output | results output |
+|---|---|---|---|---|
+| `baseline` | `ckpt/{stage}/global_step_{N}/actor` | `data/processed/test.parquet` | `eval/preds_{stage}.jsonl` | `eval/preds_{stage}.results.json` |
+| `l2` | `ckpt/{stage}-l2/global_step_{N}/actor` | `data/processed_L2/test.parquet` | `eval/preds_{stage}-l2.jsonl` | `eval/preds_{stage}-l2.results.json` |
+
+If you prefer to drive the two stages by hand (or skip the launchers
+entirely), the same commands the launcher runs are documented in the next
+sections — start with **Step 1**.
+
 ## Metrics produced (paper Table 4)
 
 | Metric | What it measures | Counted on |
