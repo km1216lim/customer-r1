@@ -77,10 +77,16 @@ NPROC_PER_NODE_AUTO=$(( GPUS / NNODES ))
 NPROC_PER_NODE=${NPROC_PER_NODE:-$NPROC_PER_NODE_AUTO}
 
 # --- NCCL --------------------------------------------------------------
-export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}        # 0 → use InfiniBand if available
-export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-""}  # set in cluster, e.g. "ib0" or "eth0"
+# K8s / containerized cluster-friendly defaults. Every var is overridable via
+# `export VAR=...` BEFORE invoking this script — re-enable P2P/IB on bare-metal
+# nodes with NVLink+InfiniBand by exporting 0.
+export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}                                  # 1: most K8s pods lack IB. flip to 0 on IB-enabled nodes.
+export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}                                # 1: P2P often misconfigured in containers.
+export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-""}                           # auto. Set to e.g. "eth0"/"ib0" if NCCL picks the wrong NIC.
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
-export TORCH_NCCL_USE_COMM_NONBLOCKING=1
+export TORCH_NCCL_USE_COMM_NONBLOCKING=${TORCH_NCCL_USE_COMM_NONBLOCKING:-0}  # 0: blocking init. The previous default (1, experimental non-blocking) caused init timeouts in K8s pods.
+export TORCH_NCCL_BLOCKING_WAIT=${TORCH_NCCL_BLOCKING_WAIT:-1}
+export NCCL_ASYNC_ERROR_HANDLING=${NCCL_ASYNC_ERROR_HANDLING:-1}
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
 
