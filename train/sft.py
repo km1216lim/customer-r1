@@ -28,6 +28,50 @@ from pathlib import Path
 
 import yaml
 
+# --- torch 2.4 -> 2.5 API backport ----------------------------------------
+# verl 0.4.1's fsdp2_clip_grad_norm_ imports
+#   torch.nn.utils.clip_grad.{clip_grads_with_norm_, _get_total_norm}
+# which only exist in torch 2.5+. We pin torch 2.4.0 for cu121 + vllm 0.6.3
+# compatibility, so the two functions are missing. Backport them in-place
+# BEFORE verl is imported, so verl's `from torch.nn.utils.clip_grad import ...`
+# picks up our shims.
+import torch
+import torch.nn.utils.clip_grad as _clip_grad
+
+if not hasattr(_clip_grad, "clip_grads_with_norm_"):
+    def _get_total_norm(tensors, norm_type=2.0, error_if_nonfinite=False, foreach=None):  # noqa: D401
+        if isinstance(tensors, torch.Tensor):
+            tensors = [tensors]
+        grads = [t for t in tensors if t is not None]
+        if len(grads) == 0:
+            return torch.tensor(0.0)
+        device = grads[0].device
+        norm_type = float(norm_type)
+        if norm_type == float("inf"):
+            norms = [g.detach().abs().max().to(device) for g in grads]
+            total_norm = torch.max(torch.stack(norms))
+        else:
+            norms = [torch.linalg.vector_norm(g.detach(), norm_type).to(device) for g in grads]
+            total_norm = torch.linalg.vector_norm(torch.stack(norms), norm_type)
+        if error_if_nonfinite and not torch.isfinite(total_norm):
+            raise RuntimeError("Total norm of order {} for gradients is non-finite".format(norm_type))
+        return total_norm
+
+    def clip_grads_with_norm_(parameters, max_norm, total_norm, foreach=None):  # noqa: D401
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+        grads = [p.grad for p in parameters if p is not None and p.grad is not None]
+        if len(grads) == 0:
+            return
+        max_norm = float(max_norm)
+        clip_coef = max_norm / (total_norm + 1e-6)
+        clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+        for g in grads:
+            g.detach().mul_(clip_coef_clamped.to(g.device))
+
+    _clip_grad._get_total_norm = _get_total_norm
+    _clip_grad.clip_grads_with_norm_ = clip_grads_with_norm_
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
