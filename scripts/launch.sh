@@ -81,7 +81,14 @@ NPROC_PER_NODE=${NPROC_PER_NODE:-$NPROC_PER_NODE_AUTO}
 # `export VAR=...` BEFORE invoking this script — re-enable P2P/IB on bare-metal
 # nodes with NVLink+InfiniBand by exporting 0.
 export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}                                  # 1: most K8s pods lack IB. flip to 0 on IB-enabled nodes.
-export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}                                # 1: P2P often misconfigured in containers.
+# NCCL_P2P_DISABLE=1 turns OFF NVLink, falling back to SHM/socket (28-100x
+# slower). The previous default (1, container-safe) made SFT run ~6 min/step
+# on 8x H100 + 65K context instead of the ~1-2 min/step we expected. Switch
+# to 0 with NCCL_P2P_LEVEL=NVL so NVLink P2P works while flaky PCIe P2P
+# stays off. Bare-metal or NCCL-init-hanging clusters can re-export
+# NCCL_P2P_DISABLE=1 before invoking this script.
+export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0}                                # 0: allow P2P so NVLink is used.
+export NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL:-NVL}                                  # NVL: only NVLink counts as P2P; skip slow PCIe P2P attempts.
 export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-""}                           # auto. Set to e.g. "eth0"/"ib0" if NCCL picks the wrong NIC.
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export TORCH_NCCL_USE_COMM_NONBLOCKING=${TORCH_NCCL_USE_COMM_NONBLOCKING:-0}  # 0: blocking init. The previous default (1, experimental non-blocking) caused init timeouts in K8s pods.
