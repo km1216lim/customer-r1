@@ -268,7 +268,39 @@ def main() -> None:
             for k, v in last_records.items()
         }
 
-    so_f1, so_detail = session_outcome_f1(sessions)
+    # Model wire output omits click_type (paper Appendix B), so we rebuild
+    # the (semantic_id -> click_type) lookup from the GT click rows in the
+    # predictions JSONL. action_schema.py verified this mapping is 1-to-1
+    # on OPeRA-filtered (4206 click rows, 1419 unique semantic_ids, zero
+    # collisions), so the lookup is exact whenever the model predicts a
+    # semantic_id the test set has seen. Without this, every predicted
+    # click is treated as not-purchase and Session Outcome F1 collapses to 0.
+    name_to_click_type: dict[str, str] = {}
+    for r in rows:
+        gt = r["gt_action"]
+        if gt.type == "click" and gt.semantic_id and gt.click_type:
+            name_to_click_type[gt.semantic_id] = gt.click_type
+
+    so_f1, so_detail = session_outcome_f1(sessions, name_to_click_type)
+
+    # Diagnostics: how many GT vs predicted purchase-terminal sessions are
+    # there at all? Useful for distinguishing "model can't predict purchase
+    # yet" (early in training) from "test set has no purchase sessions".
+    n_gt_pos = sum(
+        1 for s in sessions.values()
+        if s["gt_last"].type == "click" and s["gt_last"].click_type == "purchase"
+    )
+    n_pred_pos = 0
+    for s in sessions.values():
+        pred = s["pred_last"]
+        if pred is None or pred.type != "click":
+            continue
+        pred_ct = pred.click_type or name_to_click_type.get(pred.semantic_id or "")
+        if pred_ct == "purchase":
+            n_pred_pos += 1
+    so_detail["n_gt_purchase_sessions"] = n_gt_pos
+    so_detail["n_pred_purchase_sessions"] = n_pred_pos
+    so_detail["name_to_click_type_size"] = len(name_to_click_type)
 
     # --- rationale quality (optional) ---------------------------------------
     rat_metrics = None
