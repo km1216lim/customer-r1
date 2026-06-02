@@ -148,6 +148,12 @@ def main() -> None:
     # --- trainer -----------------------------------------------------------
     nnodes = int(os.environ.get("NNODES", "1"))
     cfg.trainer.total_training_steps = total_steps
+    # verl 0.4.1 enforces BOTH total_training_steps and total_epochs and stops
+    # at whichever is reached first. The bundled sft_trainer.yaml ships with
+    # total_epochs=4, which on OPeRA-filtered (76 steps/epoch) gives 304
+    # steps — well below paper's 2000. Override to a value high enough that
+    # total_training_steps is the only effective cap.
+    cfg.trainer.total_epochs = 9999
     cfg.trainer.project_name = base["logging"]["project"]
     cfg.trainer.experiment_name = f"{base['logging']['run_name_prefix']}-{topo.key}"
     out_dir = str(args.output_dir) if args.output_dir else f"ckpt/{base['logging']['run_name_prefix']}"
