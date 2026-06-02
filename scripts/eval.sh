@@ -84,9 +84,16 @@ if [[ -z "$STEP" ]]; then
   fi
   STEP=$(basename "$LATEST_STEP_DIR" | sed 's/global_step_//')
 fi
-MODEL_PATH="${CKPT_DIR}/global_step_${STEP}/actor"
-if [[ ! -d "$MODEL_PATH" ]]; then
-  echo "[error] model path not found: $MODEL_PATH" >&2
+# verl 0.4.1 writes the HF model files (config.json + *.safetensors + tokenizer.json)
+# directly inside global_step_N/, NOT global_step_N/actor/. Earlier verl releases
+# used the actor/ subfolder, so try both — whichever has a config.json wins.
+STEP_DIR="${CKPT_DIR}/global_step_${STEP}"
+if [[ -f "${STEP_DIR}/actor/config.json" ]]; then
+  MODEL_PATH="${STEP_DIR}/actor"
+elif [[ -f "${STEP_DIR}/config.json" ]]; then
+  MODEL_PATH="${STEP_DIR}"
+else
+  echo "[error] no HF checkpoint under ${STEP_DIR} (looked for actor/config.json and config.json)" >&2
   exit 1
 fi
 
