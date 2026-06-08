@@ -38,8 +38,10 @@ def main() -> None:
     topo = load_topology(args.topology_config, args.topology)
     base = yaml.safe_load(args.base_config.read_text(encoding="utf-8"))
 
+    # verl 0.4.1 no longer re-exports OmegaConfig as a shim — use omegaconf directly.
+    # OmegaConfig.create(...) was just an alias for omegaconf.OmegaConf.create(...).
+    from omegaconf import OmegaConf as OmegaConfig
     from verl.trainer.main_ppo import RayPPOTrainer
-    from verl.utils.config import OmegaConfig
     from reward import verl_reward_fn, RewardConfig
 
     rollout_share_gpu = (topo.rollout.mode == "collocated")
