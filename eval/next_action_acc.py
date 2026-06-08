@@ -34,6 +34,12 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "data"))
 from action_schema import Action, action_from_dict, parse_model_output  # noqa: E402
 
+# Canonical action types from the paper / action_schema. The macro F1 in
+# Table 4 is averaged over these three classes only. JSON-parse failures
+# still surface as "__INVALID__" predictions for diagnostics, but are not
+# treated as a fourth phantom class in the macro mean.
+ACTION_TYPES: tuple[str, ...] = ("click", "input", "terminate")
+
 
 # -------------------------------------------------------------------------
 # Per-step action metrics
@@ -72,16 +78,27 @@ def per_step_metrics(pred: Optional[Action], gt: Action) -> dict[str, int]:
 # Macro-F1 over action types
 # -------------------------------------------------------------------------
 
-def macro_f1(pred_types: list[str], gt_types: list[str]) -> tuple[float, dict[str, dict]]:
+def macro_f1(
+    pred_types: list[str],
+    gt_types: list[str],
+    average_labels: Optional[tuple[str, ...]] = None,
+) -> tuple[float, dict[str, dict]]:
     """Compute per-class precision/recall/F1 and unweighted macro average.
 
     Mirrors sklearn's macro-F1 semantics without the dependency. Classes with
     zero support get F1 == 0 by convention, matching sklearn's default.
+
+    The per-class breakdown covers every label observed in either predictions
+    or GT (including the "__INVALID__" pseudo-class used for parse failures),
+    so diagnostics are preserved. The macro mean runs only over `average_labels`
+    — defaulting to the canonical 3 action types — so that parse failures count
+    as misclassifications via false negatives on the real classes without
+    contributing a phantom 0-F1 fourth class that would deflate the average.
     """
-    labels = sorted(set(pred_types) | set(gt_types))
+    avg_labels = tuple(average_labels) if average_labels is not None else ACTION_TYPES
+    observed = sorted(set(pred_types) | set(gt_types))
     per_class: dict[str, dict] = {}
-    f1_sum = 0.0
-    for label in labels:
+    for label in observed:
         tp = sum(1 for p, g in zip(pred_types, gt_types) if p == label and g == label)
         fp = sum(1 for p, g in zip(pred_types, gt_types) if p == label and g != label)
         fn = sum(1 for p, g in zip(pred_types, gt_types) if p != label and g == label)
@@ -92,8 +109,8 @@ def macro_f1(pred_types: list[str], gt_types: list[str]) -> tuple[float, dict[st
             "precision": precision, "recall": recall, "f1": f1,
             "support_gt": tp + fn, "support_pred": tp + fp,
         }
-        f1_sum += f1
-    macro = f1_sum / len(labels) if labels else 0.0
+    f1_sum = sum(per_class.get(l, {"f1": 0.0})["f1"] for l in avg_labels)
+    macro = f1_sum / len(avg_labels) if avg_labels else 0.0
     return macro, per_class
 
 
