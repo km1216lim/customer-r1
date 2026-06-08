@@ -350,6 +350,14 @@ def process_split(
     rationale_synth = 0
     n_furniture_pieces_total = 0
     n_furniture_chars_total = 0
+    # Per-step compression measurement: track only history steps that
+    # actually survive the budget cut (those rendered into the prompt).
+    # This gives the apples-to-apples "chars per history step" comparison
+    # between baseline (uncompressed) and L2 (anchor-sliced) variants.
+    kept_history_step_count = 0
+    kept_history_step_chars_total = 0
+    kept_history_step_chars_samples: list[int] = []
+    session_total_steps_total = 0
 
     t0 = time.time()
     batch: list[dict] = []
@@ -419,6 +427,18 @@ def process_split(
                 elif rationale_source == "synthetic":
                     rationale_synth += 1
 
+                # Per-step compression: sum observation chars of the kept tail.
+                # history_steps[drop_until:] are the steps actually rendered.
+                n_dropped = prompt_info["n_history_dropped_html"]
+                kept_tail = history_steps[n_dropped:]
+                for ks in kept_tail:
+                    obs_len = len(ks.get("observation") or "")
+                    kept_history_step_chars_total += obs_len
+                    kept_history_step_chars_samples.append(obs_len)
+                kept_history_step_count += len(kept_tail)
+
+            session_total_steps_total += len(steps_l1)
+
             if len(batch) >= flush_every:
                 writer.write_table(pa.Table.from_pylist(batch, schema=SCHEMA))
                 batch.clear()
@@ -439,6 +459,19 @@ def process_split(
         writer.write_table(pa.Table.from_pylist(batch, schema=SCHEMA))
     writer.close()
 
+    # Per-step distribution: useful for reporting compression ratio more
+    # robustly than just the mean (long tail of huge HTML steps can skew it).
+    if kept_history_step_chars_samples:
+        import numpy as _np
+        arr = _np.asarray(kept_history_step_chars_samples)
+        history_step_chars_p50 = float(_np.percentile(arr, 50))
+        history_step_chars_p90 = float(_np.percentile(arr, 90))
+        history_step_chars_p99 = float(_np.percentile(arr, 99))
+    else:
+        history_step_chars_p50 = 0.0
+        history_step_chars_p90 = 0.0
+        history_step_chars_p99 = 0.0
+
     return {
         "out": str(out_path),
         "sessions": n_sessions,
@@ -458,6 +491,20 @@ def process_split(
         "furniture_chars_per_session_mean": (
             round(n_furniture_chars_total / n_sessions, 1) if n_sessions else 0.0
         ),
+        # Per-step compression measurement (new):
+        "mean_history_step_chars_kept": (
+            round(kept_history_step_chars_total / kept_history_step_count, 1)
+            if kept_history_step_count else 0.0
+        ),
+        "mean_history_steps_kept_per_sample": (
+            round(kept_history_step_count / n_samples, 2) if n_samples else 0.0
+        ),
+        "mean_total_session_steps": (
+            round(session_total_steps_total / n_sessions, 2) if n_sessions else 0.0
+        ),
+        "history_step_chars_p50": round(history_step_chars_p50, 1),
+        "history_step_chars_p90": round(history_step_chars_p90, 1),
+        "history_step_chars_p99": round(history_step_chars_p99, 1),
         "elapsed_seconds": round(time.time() - t0, 1),
     }
 
