@@ -40,6 +40,59 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# --- torch 2.4 -> 2.5 clip_grad backport (Ray worker context) -------------
+# verl 0.4.1's fsdp2_clip_grad_norm_ (verl/utils/fsdp_utils.py) lazily imports
+# `_clip_grads_with_norm_` and `_get_total_norm` from torch.nn.utils.clip_grad
+# at call time. Those symbols only exist in torch 2.5+. We pin torch 2.4.0
+# for cu121 + vllm 0.6.3 + flash-attn 2.6.3 ABI compatibility, so the import
+# fails the first time the actor optimizer step runs.
+#
+# train/sft.py performs the same backport for the SFT entrypoint process. For
+# GRPO, the optimizer step happens inside Ray worker actors (separate Python
+# processes), so the SFT patch is not in scope there. Workers DO import this
+# reward module when verl resolves custom_reward_function — putting the patch
+# here means every worker that uses our reward also gets the clip_grad shim,
+# before fsdp2_clip_grad_norm_ ever fires.
+import torch
+import torch.nn.utils.clip_grad as _clip_grad
+
+if not hasattr(_clip_grad, "_clip_grads_with_norm_"):
+    def _r1_get_total_norm(tensors, norm_type=2.0, error_if_nonfinite=False, foreach=None):  # noqa: D401
+        if isinstance(tensors, torch.Tensor):
+            tensors = [tensors]
+        grads = [t for t in tensors if t is not None]
+        if len(grads) == 0:
+            return torch.tensor(0.0)
+        device = grads[0].device
+        norm_type = float(norm_type)
+        if norm_type == float("inf"):
+            norms = [g.detach().abs().max().to(device) for g in grads]
+            total_norm = torch.max(torch.stack(norms))
+        else:
+            norms = [torch.linalg.vector_norm(g.detach(), norm_type).to(device) for g in grads]
+            total_norm = torch.linalg.vector_norm(torch.stack(norms), norm_type)
+        if error_if_nonfinite and not torch.isfinite(total_norm):
+            raise RuntimeError(f"Total norm of order {norm_type} for gradients is non-finite")
+        return total_norm
+
+    def _r1_clip_grads_with_norm_(parameters, max_norm, total_norm, foreach=None):  # noqa: D401
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+        grads = [p.grad for p in parameters if p is not None and p.grad is not None]
+        if len(grads) == 0:
+            return
+        max_norm = float(max_norm)
+        clip_coef = max_norm / (total_norm + 1e-6)
+        clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+        for g in grads:
+            g.detach().mul_(clip_coef_clamped.to(g.device))
+
+    # Some verl call sites import the private (underscore-prefixed) name,
+    # others import the public name. Provide both so either import works.
+    _clip_grad._get_total_norm = _r1_get_total_norm
+    _clip_grad._clip_grads_with_norm_ = _r1_clip_grads_with_norm_
+    _clip_grad.clip_grads_with_norm_ = _r1_clip_grads_with_norm_
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "data"))
 from action_schema import (  # noqa: E402
     Action,
