@@ -138,6 +138,12 @@ def main() -> None:
     cfg.actor_rollout_ref.rollout.free_cache_engine = True
     cfg.actor_rollout_ref.rollout.enable_chunked_prefill = True
     cfg.actor_rollout_ref.rollout.dtype = "bfloat16"
+    # vLLM 0.6.3 (our pin) doesn't know `disable_mm_preprocessor_cache` — that
+    # was added in vLLM 0.7. verl's bundled ppo_trainer.yaml carries it under
+    # engine_kwargs.vllm, and verl passes everything in that dict through to
+    # EngineArgs, which then raises TypeError on the unknown kwarg. Drop the
+    # field from the config so the multimodal-related extra is not forwarded.
+    cfg.actor_rollout_ref.rollout.engine_kwargs.vllm = OmegaConf.create({"swap_space": None})
     # vLLM rejects (chunked_prefill=True AND max_num_batched_tokens < max_model_len).
     # The bundled default (8192) is too small for our 65K context — raise the
     # batched-token budget so chunked prefill's per-chunk window equals one full
