@@ -105,14 +105,36 @@ NODE_RANK=${NODE_RANK:-0}
 
 echo "[launch] topology=${TOPO_KEY} stage=${STAGE} config=${CONFIG_PATH} nnodes=${NNODES} nproc/node=${NPROC_PER_NODE}"
 
-torchrun \
-  --nnodes="${NNODES}" \
-  --nproc_per_node="${NPROC_PER_NODE}" \
-  --node_rank="${NODE_RANK}" \
-  --master_addr="${MASTER_ADDR}" \
-  --master_port="${MASTER_PORT}" \
-  "train/${STAGE}.py" \
-  --topology "${TOPO_KEY}" \
-  --topology_config configs/topology.yaml \
-  --base_config "${CONFIG_PATH}" \
-  "${EXTRA_ARGS[@]}"
+# SFT and GRPO have different launch protocols.
+#
+# SFT (train/sft.py) is a verl FSDP trainer with no Ray — it expects to be
+# spawned by torchrun, one process per GPU, classic DDP-style launch.
+#
+# GRPO (train/grpo.py) wraps verl 0.4.1's main_ppo.run_ppo, which spins up
+# Ray internally and lets Ray spawn one actor per role (actor/ref/rollout).
+# Each Ray actor then does its OWN torch.distributed.init_process_group on
+# the GPUs Ray assigned. If we also pre-spawn the entry script under torchrun,
+# the four torchrun processes each call ray.init and each tries to start its
+# own Ray cluster on the same MASTER_PORT — the resulting port collisions
+# cause the inner TCPStore rendezvous to hang for the full 1800s timeout
+# (the symptom is "DistNetworkError: The client socket has timed out").
+# Launch grpo.py as a single plain-python process and let Ray handle the rest.
+if [[ "$STAGE" == "grpo" ]]; then
+  python "train/${STAGE}.py" \
+    --topology "${TOPO_KEY}" \
+    --topology_config configs/topology.yaml \
+    --base_config "${CONFIG_PATH}" \
+    "${EXTRA_ARGS[@]}"
+else
+  torchrun \
+    --nnodes="${NNODES}" \
+    --nproc_per_node="${NPROC_PER_NODE}" \
+    --node_rank="${NODE_RANK}" \
+    --master_addr="${MASTER_ADDR}" \
+    --master_port="${MASTER_PORT}" \
+    "train/${STAGE}.py" \
+    --topology "${TOPO_KEY}" \
+    --topology_config configs/topology.yaml \
+    --base_config "${CONFIG_PATH}" \
+    "${EXTRA_ARGS[@]}"
+fi
