@@ -138,6 +138,13 @@ def main() -> None:
     cfg.actor_rollout_ref.rollout.free_cache_engine = True
     cfg.actor_rollout_ref.rollout.enable_chunked_prefill = True
     cfg.actor_rollout_ref.rollout.dtype = "bfloat16"
+    # vLLM rejects (chunked_prefill=True AND max_num_batched_tokens < max_model_len).
+    # The bundled default (8192) is too small for our 65K context — raise the
+    # batched-token budget so chunked prefill's per-chunk window equals one full
+    # prompt. This keeps chunked prefill's memory benefit (it splits prefill
+    # *across* sequences in a batch) without forcing the prompt itself to be
+    # cut into smaller pieces.
+    cfg.actor_rollout_ref.rollout.max_num_batched_tokens = int(topo.context_length)
     # Same validation as ref above — rollout's log_prob batch needs a non-null value.
     cfg.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu = int(topo.per_device_micro_batch)
 
