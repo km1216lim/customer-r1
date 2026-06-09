@@ -118,6 +118,9 @@ def main() -> None:
 
     # --- reference model ---------------------------------------------------
     cfg.actor_rollout_ref.ref.fsdp_config.param_offload = True  # 7B ref fits comfortably with offload
+    # verl validates that AT LEAST ONE of log_prob_micro_batch_size /
+    # log_prob_micro_batch_size_per_gpu is set; default null fails validation.
+    cfg.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu = int(topo.per_device_micro_batch)
 
     # --- rollout (vLLM) ----------------------------------------------------
     rollout_share_gpu = (topo.rollout.mode == "collocated")
@@ -135,6 +138,8 @@ def main() -> None:
     cfg.actor_rollout_ref.rollout.free_cache_engine = True
     cfg.actor_rollout_ref.rollout.enable_chunked_prefill = True
     cfg.actor_rollout_ref.rollout.dtype = "bfloat16"
+    # Same validation as ref above — rollout's log_prob batch needs a non-null value.
+    cfg.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu = int(topo.per_device_micro_batch)
 
     # --- algorithm (GRPO) --------------------------------------------------
     cfg.algorithm.adv_estimator = "grpo"
@@ -142,10 +147,12 @@ def main() -> None:
     cfg.algorithm.use_kl_in_reward = False  # GRPO keeps KL inside the loss
 
     # --- critic ------------------------------------------------------------
-    # GRPO doesn't use a critic, but verl's schema still wants the section
-    # populated. Mirror the actor's strategy + model path so init succeeds.
+    # GRPO doesn't use a critic, but verl's schema still validates the section.
+    # Mirror the actor's strategy + model path so structural validation passes.
+    # micro_batch_size_per_gpu needed for the same null-check as ref/rollout.
     cfg.critic.strategy = "fsdp2"
     cfg.critic.model.path = init_ckpt
+    cfg.critic.ppo_micro_batch_size_per_gpu = int(topo.per_device_micro_batch)
 
     # --- trainer -----------------------------------------------------------
     out_dir = str(args.output_dir) if args.output_dir else f"ckpt/{base['logging']['run_name_prefix']}"
