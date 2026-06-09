@@ -34,6 +34,7 @@ relative advantage signal within each group — not raw reward magnitude.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -153,3 +154,68 @@ def verl_reward_fn(data_batch, cfg: Optional[RewardConfig] = None):  # pragma: n
     rewards = batch_rewards(completions, action_gts, cfg=cfg)
     import torch
     return torch.tensor(rewards, dtype=torch.float32)
+
+
+# --- verl 0.4.1 custom_reward_function entrypoint ------------------------
+# verl 0.4.1's load_reward_manager (verl/trainer/ppo/reward.py) discovers a
+# user-defined reward via config.custom_reward_function.{path, name} and calls
+# it with the per-sample signature below. The naive reward manager iterates
+# over each rollout and invokes this once per sample.
+#
+# Reward weights cannot be passed through verl's hydra schema (no slot for
+# domain-specific reward kwargs), so train/grpo.py exports them as env vars
+# (CUSTOMER_R1_INPUT_WEIGHT, ...) before run_ppo. We materialize a
+# module-level RewardConfig once on first call from those env vars.
+
+_REWARD_CFG: Optional[RewardConfig] = None
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return float(raw)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _load_cfg_from_env() -> RewardConfig:
+    return RewardConfig(
+        input_weight=_env_float("CUSTOMER_R1_INPUT_WEIGHT", 2000.0),
+        hard_click_weight=_env_float("CUSTOMER_R1_HARD_CLICK_WEIGHT", 1000.0),
+        product_option_weight=_env_float("CUSTOMER_R1_PRODUCT_OPTION_WEIGHT", 10.0),
+        review_search_weight=_env_float("CUSTOMER_R1_REVIEW_SEARCH_WEIGHT", 1.0),
+        terminate_weight=_env_float("CUSTOMER_R1_TERMINATE_WEIGHT", 1.0),
+        wrong_click_penalty=_env_float("CUSTOMER_R1_WRONG_CLICK_PENALTY", -1.0),
+        wrong_non_click_weight=_env_float("CUSTOMER_R1_WRONG_NON_CLICK_WEIGHT", 0.0),
+        format_bonus=_env_float("CUSTOMER_R1_FORMAT_BONUS", 0.1),
+        rl_only=_env_bool("CUSTOMER_R1_RL_ONLY", False),
+    )
+
+
+def compute_score(data_source, solution_str, ground_truth, extra_info=None) -> float:  # noqa: ARG001
+    """verl 0.4.1 custom reward entry.
+
+    Args:
+        data_source: per-sample tag from the dataset's `data_source` column —
+            we don't route on it (single-source dataset), so ignored.
+        solution_str: model rollout text (the assistant response only,
+            not the prompt).
+        ground_truth: GT action serialized as JSON string. Comes from the
+            parquet's `reward_model.ground_truth` column (set by
+            data/enrich_for_rl.py to the row's `action_gt`).
+        extra_info: optional dict from the parquet's `extra_info` column.
+            Unused here.
+
+    Returns:
+        scalar reward (correctness + format bonus).
+    """
+    global _REWARD_CFG
+    if _REWARD_CFG is None:
+        _REWARD_CFG = _load_cfg_from_env()
+    return compute_reward(solution_str, ground_truth, _REWARD_CFG)
