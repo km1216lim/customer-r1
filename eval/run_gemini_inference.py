@@ -203,8 +203,20 @@ def infer_one(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", type=Path, required=True,
-                    help="Parquet with `prompt_text` and `action_gt` columns.")
+    ap.add_argument("--data", type=Path,
+                    help="Parquet or JSONL with `prompt_text` and `action_gt` columns. "
+                         "Mutually exclusive with --traj_jsonl (raw render mode).")
+    ap.add_argument("--traj_jsonl", type=Path,
+                    help="Trajectories JSONL (one row per session). When set, prompts are "
+                         "rendered on-the-fly per request from this file + --system_prompt "
+                         "+ --user_template. Avoids materializing a 1-15 MB prompt parquet "
+                         "on memory-constrained machines where pyarrow / json.dumps can OOM. "
+                         "Default rationale source per step: rationale_synth first, then "
+                         "rationale_gt — same as data/render_raw_for_gemini.py.")
+    ap.add_argument("--system_prompt", type=Path, default=Path("prompts/system.txt"),
+                    help="Used only with --traj_jsonl. Default: prompts/system.txt.")
+    ap.add_argument("--user_template", type=Path, default=Path("prompts/user.jinja"),
+                    help="Used only with --traj_jsonl. Default: prompts/user.jinja.")
     ap.add_argument("--model", default="gemini-2.5-flash",
                     help="Vertex AI model ID. Default: gemini-2.5-flash.")
     ap.add_argument("--output", type=Path, required=True,
@@ -277,30 +289,60 @@ def main() -> None:
 
     # --- load data --------------------------------------------------------
     # Memory-friendly: stream rows without materializing the whole dataset.
-    # The full test.parquet for OPeRA-filtered carries ~160 KB of prompt_text
-    # per row; the raw renderer's JSONL output is even larger (1-15 MB per
-    # row). Both formats are streamed one row at a time.
+    # Three input modes:
+    #   - --data with .parquet  : pyarrow streaming
+    #   - --data with .jsonl    : line-by-line JSON
+    #   - --traj_jsonl          : raw render mode (one session at a time, each
+    #     session's per-step prompt rendered on demand). Avoids the 200 MB-
+    #     class allocations that kill the local-PC parquet path on big raw
+    #     prompts.
     NEEDED = ["user_id", "session_id", "step_idx", "prompt_text", "action_gt"]
     OPTIONAL = ["rationale_gt", "is_session_last_step"]
 
-    is_jsonl = args.data.suffix.lower() == ".jsonl"
-    if is_jsonl:
-        # Count rows lazily (one quick file scan) just to populate the progress bar.
-        with args.data.open("r", encoding="utf-8") as f:
-            total_rows = sum(1 for _ in f)
-        cols = NEEDED + OPTIONAL  # availability is per-row in JSONL; checked later
+    if args.traj_jsonl is not None:
+        # --- raw render mode -----------------------------------------------
+        if args.data is not None:
+            sys.exit("[gemini] pass either --data OR --traj_jsonl, not both")
+        from jinja2 import Template
+        if not args.system_prompt.exists():
+            sys.exit(f"[gemini] system prompt not found: {args.system_prompt}")
+        if not args.user_template.exists():
+            sys.exit(f"[gemini] user template not found: {args.user_template}")
+        system_text_raw = args.system_prompt.read_text(encoding="utf-8")
+        user_template = Template(args.user_template.read_text(encoding="utf-8"))
+        # Pre-count total rows for the progress bar (cheap — one scan, only sums
+        # steps without reading observation HTML into memory).
+        total_rows = 0
+        with args.traj_jsonl.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    sess = json.loads(line)
+                    total_rows += len(sess.get("steps", []))
+                except json.JSONDecodeError:
+                    continue
+        cols = ["traj_jsonl (raw render)"]
     else:
-        pf = pq.ParquetFile(str(args.data))
-        available = set(pf.schema_arrow.names)
-        cols = [c for c in NEEDED if c in available] + [c for c in OPTIONAL if c in available]
-        missing_required = [c for c in NEEDED if c not in available]
-        if missing_required:
-            sys.exit(f"[gemini] parquet {args.data} missing required columns: {missing_required}")
-        total_rows = pf.metadata.num_rows
+        if args.data is None:
+            sys.exit("[gemini] pass --data PATH or --traj_jsonl PATH")
+        is_jsonl = args.data.suffix.lower() == ".jsonl"
+        if is_jsonl:
+            with args.data.open("r", encoding="utf-8") as f:
+                total_rows = sum(1 for _ in f)
+            cols = NEEDED + OPTIONAL
+        else:
+            pf = pq.ParquetFile(str(args.data))
+            available = set(pf.schema_arrow.names)
+            cols = [c for c in NEEDED if c in available] + [c for c in OPTIONAL if c in available]
+            missing_required = [c for c in NEEDED if c not in available]
+            if missing_required:
+                sys.exit(f"[gemini] parquet {args.data} missing required columns: {missing_required}")
+            total_rows = pf.metadata.num_rows
 
     n_target = min(total_rows, args.max_samples) if args.max_samples is not None else total_rows
-    print(f"[gemini] streaming {n_target}/{total_rows} rows from {args.data} "
-          f"(format={'jsonl' if is_jsonl else 'parquet'}, cols={cols})")
+    src = args.traj_jsonl if args.traj_jsonl is not None else args.data
+    print(f"[gemini] streaming {n_target}/{total_rows} rows from {src} (cols={cols})")
 
     # --- resume / skip-existing ------------------------------------------
     seen: set[tuple] = set()
@@ -354,11 +396,81 @@ def main() -> None:
     n_seen = 0
     # Small batches make memory predictable. Tune up if your machine has
     # plenty of RAM and you want fewer batch-boundary stalls.
-    BATCH_SIZE = 32
+    # Raw render mode: each prompt is 1-15 MB so we keep the batch tiny
+    # (= max_concurrent) to bound peak RAM to ~(max_concurrent + 1) prompts.
+    BATCH_SIZE = args.max_concurrent if args.traj_jsonl is not None else 32
+
+    def _step_rationale(step: dict) -> str:
+        return step.get("rationale_synth") or step.get("rationale_gt") or ""
+
+    def _render_one_prompt(persona_json: str, history: list[dict], current_obs: str) -> str:
+        """On-the-fly Qwen-templated prompt for a single step. Memory-efficient
+        because we only hold one rendered string at a time and the caller drops
+        it after the API call returns."""
+        history_render = [
+            {
+                "observation": s["observation"],
+                "rationale": _step_rationale(s),
+                "action_wire_json": s["action_wire_json"],
+            }
+            for s in history
+        ]
+        user_text = user_template.render(
+            persona_json=persona_json,
+            history=history_render,
+            current_observation=current_obs,
+        )
+        # Hand chat template (matches data/render_raw_for_gemini.py).
+        return "".join((
+            "<|im_start|>system\n",
+            system_text_raw,
+            "<|im_end|>\n<|im_start|>user\n",
+            user_text,
+            "<|im_end|>\n<|im_start|>assistant\n",
+        ))
 
     def _iter_input_batches(batch_size: int):
-        """Yield list[dict] batches from either a parquet or JSONL input."""
-        if is_jsonl:
+        """Yield list[dict] batches from parquet, JSONL, or trajectories.
+
+        Each row is a dict with at least the columns NEEDED; raw render mode
+        additionally fills prompt_text from on-the-fly jinja rendering.
+        """
+        if args.traj_jsonl is not None:
+            # Raw render mode: stream sessions, render per-step prompts on demand.
+            with args.traj_jsonl.open("r", encoding="utf-8") as f:
+                buf: list[dict] = []
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    session = json.loads(line)
+                    persona_json = json.dumps(session.get("persona", {}), ensure_ascii=False)
+                    steps = session["steps"]
+                    user_id = session.get("user_id", "")
+                    session_id = session.get("session_id", "")
+                    for t_idx in range(len(steps)):
+                        history = steps[:t_idx]
+                        current = steps[t_idx]
+                        prompt_text = _render_one_prompt(
+                            persona_json, history, current["observation"]
+                        )
+                        row = {
+                            "user_id": user_id,
+                            "session_id": session_id,
+                            "step_idx": int(t_idx),
+                            "prompt_text": prompt_text,
+                            "action_gt": current["action_wire_json"],
+                            "rationale_gt": _step_rationale(current),
+                        }
+                        buf.append(row)
+                        if len(buf) >= batch_size:
+                            yield buf
+                            buf = []
+                            # Drop prompt_text refs aggressively so the GC can
+                            # reclaim the 1-15 MB strings before the next session.
+                if buf:
+                    yield buf
+        elif is_jsonl:
             with args.data.open("r", encoding="utf-8") as f:
                 buf: list[dict] = []
                 for line in f:
