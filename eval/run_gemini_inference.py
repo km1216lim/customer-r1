@@ -251,11 +251,24 @@ def main() -> None:
     )
 
     # --- load data --------------------------------------------------------
-    table = pq.read_table(str(args.data))
-    df = table.to_pandas()
-    if args.max_samples is not None:
-        df = df.head(args.max_samples)
-    print(f"[gemini] loaded {len(df)} rows from {args.data}")
+    # Memory-friendly: open the parquet without materializing all rows. The
+    # full test.parquet for OPeRA-filtered carries ~160 KB of prompt_text per
+    # row, so loading 992 rows + pandas overhead can push past 1 GB on a
+    # workstation. Read only the columns we need and stream in small batches.
+    NEEDED = ["user_id", "session_id", "step_idx", "prompt_text", "action_gt"]
+    OPTIONAL = ["rationale_gt", "is_session_last_step"]
+
+    pf = pq.ParquetFile(str(args.data))
+    available = set(pf.schema_arrow.names)
+    cols = [c for c in NEEDED if c in available] + [c for c in OPTIONAL if c in available]
+    missing_required = [c for c in NEEDED if c not in available]
+    if missing_required:
+        sys.exit(f"[gemini] parquet {args.data} missing required columns: {missing_required}")
+
+    total_rows = pf.metadata.num_rows
+    n_target = min(total_rows, args.max_samples) if args.max_samples is not None else total_rows
+    print(f"[gemini] streaming {n_target}/{total_rows} rows from {args.data} "
+          f"(cols={cols})")
 
     # --- resume / skip-existing ------------------------------------------
     seen: set[tuple] = set()
@@ -294,28 +307,53 @@ def main() -> None:
         return out
 
     # --- run -------------------------------------------------------------
+    # Stream parquet → submit one batch of futures at a time → wait, drain,
+    # move on. Keeps RAM bounded to roughly one batch worth of prompt_text
+    # plus ThreadPoolExecutor's in-flight requests (max_concurrent of them).
     args.output.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if args.skip_existing and args.output.exists() else "w"
-    rows = df.to_dict(orient="records")
     n_done = 0
     n_failed = 0
+    n_seen = 0
+    # Small batches make memory predictable. Tune up if your machine has
+    # plenty of RAM and you want fewer batch-boundary stalls.
+    BATCH_SIZE = 32
+
     with args.output.open(mode, encoding="utf-8") as fout:
         with ThreadPoolExecutor(max_workers=args.max_concurrent) as pool:
-            futures = {pool.submit(_row_worker, r): r for r in rows}
-            for fut in tqdm(as_completed(futures), total=len(futures), desc=args.model):
-                try:
-                    result = fut.result()
-                except Exception as e:  # noqa: BLE001
-                    n_failed += 1
-                    sys.stderr.write(f"[gemini] row worker exception: {e}\n")
-                    continue
-                if result is None:
-                    continue  # skipped due to --skip_existing
-                fout.write(json.dumps(result, ensure_ascii=False) + "\n")
-                fout.flush()
-                n_done += 1
-                if not result["completion"]:
-                    n_failed += 1
+            pbar = tqdm(total=n_target, desc=args.model)
+            try:
+                for record_batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=cols):
+                    rows = record_batch.to_pylist()
+                    # Honor --max_samples mid-stream.
+                    if n_seen + len(rows) > n_target:
+                        rows = rows[: n_target - n_seen]
+                    n_seen += len(rows)
+                    if not rows:
+                        break
+
+                    futures = [pool.submit(_row_worker, r) for r in rows]
+                    for fut in as_completed(futures):
+                        try:
+                            result = fut.result()
+                        except Exception as e:  # noqa: BLE001
+                            n_failed += 1
+                            sys.stderr.write(f"[gemini] row worker exception: {e}\n")
+                            pbar.update(1)
+                            continue
+                        pbar.update(1)
+                        if result is None:
+                            continue  # skipped due to --skip_existing
+                        fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        fout.flush()
+                        n_done += 1
+                        if not result["completion"]:
+                            n_failed += 1
+
+                    if n_seen >= n_target:
+                        break
+            finally:
+                pbar.close()
 
     print(f"[gemini] wrote {n_done} predictions to {args.output} "
           f"({n_failed} empty / failed)")
