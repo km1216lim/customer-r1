@@ -403,10 +403,51 @@ def main() -> None:
     def _step_rationale(step: dict) -> str:
         return step.get("rationale_synth") or step.get("rationale_gt") or ""
 
-    def _render_one_prompt(persona_json: str, history: list[dict], current_obs: str) -> str:
+    def _step_chars(step: dict) -> int:
+        """Approximate per-step contribution to the rendered user_text length.
+        Adds observation HTML + rationale + the action_wire_json — the three
+        big strings the jinja template emits per history entry."""
+        return (
+            len(step.get("observation", ""))
+            + len(_step_rationale(step))
+            + len(step.get("action_wire_json", ""))
+        )
+
+    # Hard cap on the rendered prompt size in chars. Two reasons:
+    #   1. Gemini 2.5 / 3.5 Flash reject inputs over 1,048,576 tokens with
+    #      400 "input token count exceeds maximum" — we observed this on
+    #      late-session steps where history accumulates 1M+ HTML tokens.
+    #   2. Even before the API would reject, the local jinja render OOMs on
+    #      8 GB Windows once the rendered string and its intermediates push
+    #      past ~3 MB on a heap fragmented by hundreds of prior iterations.
+    # chars/4 ~ tokens is the standard heuristic for English-y text; OPeRA
+    # HTML runs a bit denser (chars/4 underestimates Gemini's count by 10-20%).
+    # Cap at 2.5 M chars to leave safe headroom on both axes.
+    RAW_RENDER_CHAR_BUDGET = 2_500_000
+
+    def _truncate_history_to_budget(history: list[dict], current_obs_chars: int) -> tuple[list[dict], int]:
+        """Drop oldest history steps until estimated total prompt chars fits
+        RAW_RENDER_CHAR_BUDGET. Returns (kept_history, n_dropped). Mirrors the
+        paper baseline's oldest-step-drop policy, but applied here on the raw
+        prompt to keep it inside Gemini's window and our local RAM budget."""
+        # Fixed-overhead estimate: system text + chat template wrapper + persona
+        # block + current observation. Persona is small; the rest are mostly
+        # the system text and the current obs.
+        SYSTEM_OVERHEAD_CHARS = len(system_text_raw) + 256  # template tags etc
+        base = SYSTEM_OVERHEAD_CHARS + current_obs_chars
+        sizes = [_step_chars(s) for s in history]
+        total = base + sum(sizes)
+        drop = 0
+        while total > RAW_RENDER_CHAR_BUDGET and drop < len(history):
+            total -= sizes[drop]
+            drop += 1
+        return history[drop:], drop
+
+    def _render_one_prompt(persona_json: str, history: list[dict], current_obs: str) -> tuple[str, int]:
         """On-the-fly Qwen-templated prompt for a single step. Memory-efficient
         because we only hold one rendered string at a time and the caller drops
-        it after the API call returns."""
+        it after the API call returns. Returns (prompt_text, n_history_dropped)."""
+        history, n_dropped = _truncate_history_to_budget(history, len(current_obs))
         history_render = [
             {
                 "observation": s["observation"],
@@ -421,13 +462,14 @@ def main() -> None:
             current_observation=current_obs,
         )
         # Hand chat template (matches data/render_raw_for_gemini.py).
-        return "".join((
+        full = "".join((
             "<|im_start|>system\n",
             system_text_raw,
             "<|im_end|>\n<|im_start|>user\n",
             user_text,
             "<|im_end|>\n<|im_start|>assistant\n",
         ))
+        return full, n_dropped
 
     def _iter_input_batches(batch_size: int):
         """Yield list[dict] batches from parquet, JSONL, or trajectories.
@@ -451,7 +493,7 @@ def main() -> None:
                     for t_idx in range(len(steps)):
                         history = steps[:t_idx]
                         current = steps[t_idx]
-                        prompt_text = _render_one_prompt(
+                        prompt_text, n_dropped = _render_one_prompt(
                             persona_json, history, current["observation"]
                         )
                         row = {
@@ -461,12 +503,19 @@ def main() -> None:
                             "prompt_text": prompt_text,
                             "action_gt": current["action_wire_json"],
                             "rationale_gt": _step_rationale(current),
+                            "n_history_dropped": n_dropped,
                         }
                         buf.append(row)
                         if len(buf) >= batch_size:
                             yield buf
                             buf = []
-                            # Drop prompt_text refs aggressively so the GC can
+                            # Force a GC pass between batches. After hundreds
+                            # of multi-MB prompt allocations on 8 GB Windows
+                            # the heap fragments enough that jinja's next
+                            # multi-MB allocation can MemoryError even with
+                            # plenty of total free RAM.
+                            import gc as _gc
+                            _gc.collect()
                             # reclaim the 1-15 MB strings before the next session.
                 if buf:
                     yield buf
