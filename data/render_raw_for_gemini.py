@@ -84,13 +84,6 @@ def _render_user(template: Template, persona_json: str, history_render: list[dic
     )
 
 
-_QWEN_CHAT_TEMPLATE = (
-    "<|im_start|>system\n{system}<|im_end|>\n"
-    "<|im_start|>user\n{user}<|im_end|>\n"
-    "<|im_start|>assistant\n"
-)
-
-
 def _chat_template_text(tokenizer, system_text: str, user_text: str) -> str:
     """Apply the Qwen2.5 chat template.
 
@@ -101,9 +94,20 @@ def _chat_template_text(tokenizer, system_text: str, user_text: str) -> str:
     The downstream consumer is Gemini, which uses its own tokenizer, so
     the only consequence of the hand template is that we can't compute
     Qwen-token counts.
+
+    Implementation: use "".join() over a list rather than .format(), since
+    for multi-megabyte user_text the format call has a higher transient
+    memory peak (the result string + the input + format's internal buffer)
+    while "".join() lets Python pre-size the result with a single allocation.
     """
     if tokenizer is None:
-        return _QWEN_CHAT_TEMPLATE.format(system=system_text, user=user_text)
+        return "".join((
+            "<|im_start|>system\n",
+            system_text,
+            "<|im_end|>\n<|im_start|>user\n",
+            user_text,
+            "<|im_end|>\n<|im_start|>assistant\n",
+        ))
     return tokenizer.apply_chat_template(
         [{"role": "system", "content": system_text},
          {"role": "user",   "content": user_text}],
@@ -139,10 +143,14 @@ def process_split(
     system_text: str,
     in_path: Path,
     out_path: Path,
-    flush_every: int = 64,
+    flush_every: int = 1,
     limit_sessions: Optional[int] = None,
     progress_every: int = 25,
 ) -> dict:
+    # flush_every=1 by default: raw prompts run 1-15 MB each, so even 16
+    # accumulated rows can push past 200 MB in the batch list plus pyarrow's
+    # table-build allocation. Writing one row at a time keeps peak RAM at
+    # ~one row, fits an 8 GB workstation comfortably.
     out_path.parent.mkdir(parents=True, exist_ok=True)
     writer = pq.ParquetWriter(out_path, SCHEMA, compression="zstd")
 
