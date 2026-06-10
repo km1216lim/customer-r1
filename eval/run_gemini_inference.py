@@ -1,0 +1,325 @@
+"""Gemini inference for Customer-R1 Table 4 evaluation.
+
+Drop-in replacement for `eval/run_inference.py`'s vLLM pipeline — reads the
+SAME parquet shape (prompt_text + action_gt + identifier columns) and writes
+the SAME JSONL shape (user_id, session_id, step_idx, completion, action_gt,
+...). Means `eval/next_action_acc.py` can score Gemini predictions with no
+changes.
+
+Two intended uses:
+
+1. **Same-budget comparison (Option A3)** — feed Gemini the same 65K-truncated
+   baseline parquet that we already use for our SFT/GRPO eval. Tests model
+   capability at identical context budget.
+
+       python eval/run_gemini_inference.py \\
+           --data data/processed/test.parquet \\
+           --model gemini-2.5-flash \\
+           --output eval/preds_gemini25flash_baseline65k.jsonl
+
+2. **Raw / untruncated comparison** — once data/render_raw_for_gemini.py is
+   run, feed the resulting test_raw.parquet to give Gemini the full session
+   history it can hold (1M+ context).
+
+       python eval/run_gemini_inference.py \\
+           --data data/processed_raw/test_raw.parquet \\
+           --model gemini-2.5-flash \\
+           --output eval/preds_gemini25flash_raw.jsonl
+
+Auth: same pattern as gemini_text_api_test.py — service account JSON pointed
+to by `GOOGLE_APPLICATION_CREDENTIALS` env var. Pass `--credentials PATH`
+to set it from the CLI.
+
+Output format (per parsed JSONL row):
+    {
+      "user_id": ...,
+      "session_id": ...,
+      "step_idx": ...,
+      "completion": "<raw JSON string returned by Gemini>",
+      "action_gt": "<JSON string from the parquet's action_gt column>",
+      "rationale_gt": "<from parquet if present>",
+      "is_session_last_step": ...
+    }
+The `completion` field is JSON text — eval/next_action_acc.py:parse_model_output
+handles the same shape that vLLM produces from our trained model.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Optional
+
+import pyarrow.parquet as pq
+from tqdm import tqdm
+
+
+# Customer-R1 action wire format (paper Appendix B). Used as response_schema
+# to force Gemini's structured output to match what parse_model_output expects.
+# `additional_properties=False` would be cleaner but Vertex's schema validator
+# is finicky about it across model versions — leave it permissive.
+ACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "rationale": {
+            "type": "string",
+            "description": "One short paragraph explaining why this next action is correct."
+        },
+        "action": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["click", "input", "terminate"],
+                    "description": "The action verb."
+                },
+                "semantic_id": {
+                    "type": "string",
+                    "description": "Required for click/input. Element identifier from the observation."
+                },
+                "click_type": {
+                    "type": "string",
+                    "description": "Sub-type for click actions (purchase, search, review, ...)."
+                },
+                "input_text": {
+                    "type": "string",
+                    "description": "Required for input actions. The text the user types."
+                }
+            },
+            "required": ["type"]
+        }
+    },
+    "required": ["rationale", "action"]
+}
+
+
+# Qwen chat-template fragments that our parquet's `prompt_text` carries.
+# We strip them to recover the clean system + user content to hand to Gemini,
+# which uses its own dialogue framing.
+_QWEN_TAGS_RE = re.compile(
+    r"<\|im_start\|>(system|user|assistant)\s*\n?(.*?)(?=<\|im_end\|>)",
+    re.DOTALL,
+)
+
+
+def split_qwen_prompt(prompt_text: str) -> tuple[str, str]:
+    """Pull (system, user) content out of a Qwen chat-templated prompt.
+
+    Returns ("", whole_string) as a safe fallback when the template tags
+    aren't found — Gemini still gets the prompt, just without a separate
+    system_instruction.
+    """
+    parts = {m.group(1): m.group(2).strip() for m in _QWEN_TAGS_RE.finditer(prompt_text)}
+    system = parts.get("system", "")
+    user = parts.get("user", "")
+    if not user:
+        # Fallback — pass the entire string as a user message.
+        return "", prompt_text
+    return system, user
+
+
+def call_gemini_with_retry(
+    model,
+    system_instruction: str,
+    user_content: str,
+    generation_config,
+    max_retries: int = 5,
+    initial_backoff: float = 2.0,
+) -> Optional[str]:
+    """Call Gemini, retry on transient errors with exponential backoff.
+
+    Returns the raw text response on success, None on permanent failure.
+    Vertex throttling (429, 503), brief 5xx, and connection drops are all
+    transient. Schema-validation failures from the model are NOT retried —
+    we just let them propagate as the response text for the scorer to mark
+    as INVALID.
+    """
+    from vertexai.generative_models import GenerativeModel
+    # Late import so the script can be imported without vertexai installed,
+    # e.g. for unit testing the prompt-splitting logic.
+    backoff = initial_backoff
+    last_err: Optional[Exception] = None
+    for attempt in range(max_retries):
+        try:
+            # The vertexai SDK's GenerativeModel API doesn't take system
+            # instruction in generate_content — pass it as the model's
+            # constructor arg via a fresh instance, OR prepend it as a
+            # user-role preamble. Newer SDK versions accept
+            # `system_instruction` on GenerativeModel(), so we set it once
+            # at the call site (see infer_one).
+            response = model.generate_content(
+                user_content,
+                generation_config=generation_config,
+            )
+            return response.text
+        except Exception as e:  # noqa: BLE001 — Vertex raises a wide variety
+            last_err = e
+            msg = str(e).lower()
+            transient = any(x in msg for x in [
+                "429", "503", "504", "deadline", "resource exhausted",
+                "internal error", "timeout", "connection",
+            ])
+            if not transient or attempt == max_retries - 1:
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+    if last_err is not None:
+        sys.stderr.write(f"[gemini] giving up after {max_retries} retries: {last_err}\n")
+    return None
+
+
+def infer_one(
+    model,
+    generation_config,
+    row: dict,
+) -> dict:
+    """Run Gemini on one parquet row, return the JSONL record to emit."""
+    system, user = split_qwen_prompt(row["prompt_text"])
+    # The SDK's GenerativeModel set at the call site already has
+    # system_instruction baked in; here we only send the user content.
+    completion = call_gemini_with_retry(model, system, user, generation_config)
+    out = {
+        "user_id": row.get("user_id"),
+        "session_id": row.get("session_id"),
+        "step_idx": row.get("step_idx"),
+        "completion": completion if completion is not None else "",
+        "action_gt": row.get("action_gt"),
+    }
+    if "rationale_gt" in row:
+        out["rationale_gt"] = row["rationale_gt"]
+    if "is_session_last_step" in row:
+        out["is_session_last_step"] = row["is_session_last_step"]
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data", type=Path, required=True,
+                    help="Parquet with `prompt_text` and `action_gt` columns.")
+    ap.add_argument("--model", default="gemini-2.5-flash",
+                    help="Vertex AI model ID. Default: gemini-2.5-flash.")
+    ap.add_argument("--output", type=Path, required=True,
+                    help="Output JSONL path (will be overwritten).")
+    ap.add_argument("--credentials",
+                    help="Path to service account JSON. If set, exports "
+                         "GOOGLE_APPLICATION_CREDENTIALS for this process.")
+    ap.add_argument("--location", default="us-central1",
+                    help="Vertex AI region. Default: us-central1.")
+    ap.add_argument("--max_concurrent", type=int, default=5,
+                    help="Concurrent API calls. Keep ≤ 5-8 to avoid rate limits.")
+    ap.add_argument("--max_output_tokens", type=int, default=1024,
+                    help="Cap on response length. 1024 fits a JSON action comfortably.")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="Greedy by default for reproducibility.")
+    ap.add_argument("--max_samples", type=int, default=None,
+                    help="Only run the first N rows. Useful for sanity tests.")
+    ap.add_argument("--skip_existing", action="store_true",
+                    help="If output JSONL exists, skip rows already present "
+                         "(matched on (user_id, session_id, step_idx)).")
+    args = ap.parse_args()
+
+    if args.credentials:
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = args.credentials
+    if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        sys.exit("[gemini] GOOGLE_APPLICATION_CREDENTIALS not set. "
+                 "Pass --credentials PATH or export it in the shell.")
+
+    # Import here so --help works without the SDK installed.
+    import vertexai
+    from vertexai.generative_models import GenerativeModel, GenerationConfig
+
+    vertexai.init(location=args.location)
+
+    # The task instructions in the parquet's prompt are bundled into the
+    # `<|im_start|>system` segment that we strip out per-row in split_qwen_prompt.
+    # We rebuild a per-row `GenerativeModel` instance with that segment as
+    # `system_instruction` so each row gets the proper system framing —
+    # cheaper than baking the system text into the user content for very
+    # long prompts, and faithful to the same separation Qwen sees at train
+    # time.
+    generation_config = GenerationConfig(
+        temperature=args.temperature,
+        max_output_tokens=args.max_output_tokens,
+        response_mime_type="application/json",
+        response_schema=ACTION_SCHEMA,
+    )
+
+    # --- load data --------------------------------------------------------
+    table = pq.read_table(str(args.data))
+    df = table.to_pandas()
+    if args.max_samples is not None:
+        df = df.head(args.max_samples)
+    print(f"[gemini] loaded {len(df)} rows from {args.data}")
+
+    # --- resume / skip-existing ------------------------------------------
+    seen: set[tuple] = set()
+    if args.skip_existing and args.output.exists():
+        with args.output.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    seen.add((r.get("user_id"), r.get("session_id"), r.get("step_idx")))
+                except json.JSONDecodeError:
+                    continue
+        print(f"[gemini] resume: skipping {len(seen)} rows already in {args.output}")
+
+    # --- per-row worker --------------------------------------------------
+    def _row_worker(row_dict: dict) -> Optional[dict]:
+        key = (row_dict.get("user_id"), row_dict.get("session_id"), row_dict.get("step_idx"))
+        if key in seen:
+            return None
+        system, user = split_qwen_prompt(row_dict["prompt_text"])
+        model = GenerativeModel(
+            args.model,
+            system_instruction=system if system else None,
+        )
+        completion = call_gemini_with_retry(model, system, user, generation_config)
+        out = {
+            "user_id": row_dict.get("user_id"),
+            "session_id": row_dict.get("session_id"),
+            "step_idx": row_dict.get("step_idx"),
+            "completion": completion if completion is not None else "",
+            "action_gt": row_dict.get("action_gt"),
+        }
+        if "rationale_gt" in row_dict:
+            out["rationale_gt"] = row_dict["rationale_gt"]
+        if "is_session_last_step" in row_dict:
+            out["is_session_last_step"] = row_dict["is_session_last_step"]
+        return out
+
+    # --- run -------------------------------------------------------------
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if args.skip_existing and args.output.exists() else "w"
+    rows = df.to_dict(orient="records")
+    n_done = 0
+    n_failed = 0
+    with args.output.open(mode, encoding="utf-8") as fout:
+        with ThreadPoolExecutor(max_workers=args.max_concurrent) as pool:
+            futures = {pool.submit(_row_worker, r): r for r in rows}
+            for fut in tqdm(as_completed(futures), total=len(futures), desc=args.model):
+                try:
+                    result = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    n_failed += 1
+                    sys.stderr.write(f"[gemini] row worker exception: {e}\n")
+                    continue
+                if result is None:
+                    continue  # skipped due to --skip_existing
+                fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+                fout.flush()
+                n_done += 1
+                if not result["completion"]:
+                    n_failed += 1
+
+    print(f"[gemini] wrote {n_done} predictions to {args.output} "
+          f"({n_failed} empty / failed)")
+
+
+if __name__ == "__main__":
+    main()
