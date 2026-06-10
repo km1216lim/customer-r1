@@ -276,24 +276,31 @@ def main() -> None:
     )
 
     # --- load data --------------------------------------------------------
-    # Memory-friendly: open the parquet without materializing all rows. The
-    # full test.parquet for OPeRA-filtered carries ~160 KB of prompt_text per
-    # row, so loading 992 rows + pandas overhead can push past 1 GB on a
-    # workstation. Read only the columns we need and stream in small batches.
+    # Memory-friendly: stream rows without materializing the whole dataset.
+    # The full test.parquet for OPeRA-filtered carries ~160 KB of prompt_text
+    # per row; the raw renderer's JSONL output is even larger (1-15 MB per
+    # row). Both formats are streamed one row at a time.
     NEEDED = ["user_id", "session_id", "step_idx", "prompt_text", "action_gt"]
     OPTIONAL = ["rationale_gt", "is_session_last_step"]
 
-    pf = pq.ParquetFile(str(args.data))
-    available = set(pf.schema_arrow.names)
-    cols = [c for c in NEEDED if c in available] + [c for c in OPTIONAL if c in available]
-    missing_required = [c for c in NEEDED if c not in available]
-    if missing_required:
-        sys.exit(f"[gemini] parquet {args.data} missing required columns: {missing_required}")
+    is_jsonl = args.data.suffix.lower() == ".jsonl"
+    if is_jsonl:
+        # Count rows lazily (one quick file scan) just to populate the progress bar.
+        with args.data.open("r", encoding="utf-8") as f:
+            total_rows = sum(1 for _ in f)
+        cols = NEEDED + OPTIONAL  # availability is per-row in JSONL; checked later
+    else:
+        pf = pq.ParquetFile(str(args.data))
+        available = set(pf.schema_arrow.names)
+        cols = [c for c in NEEDED if c in available] + [c for c in OPTIONAL if c in available]
+        missing_required = [c for c in NEEDED if c not in available]
+        if missing_required:
+            sys.exit(f"[gemini] parquet {args.data} missing required columns: {missing_required}")
+        total_rows = pf.metadata.num_rows
 
-    total_rows = pf.metadata.num_rows
     n_target = min(total_rows, args.max_samples) if args.max_samples is not None else total_rows
     print(f"[gemini] streaming {n_target}/{total_rows} rows from {args.data} "
-          f"(cols={cols})")
+          f"(format={'jsonl' if is_jsonl else 'parquet'}, cols={cols})")
 
     # --- resume / skip-existing ------------------------------------------
     seen: set[tuple] = set()
@@ -349,12 +356,30 @@ def main() -> None:
     # plenty of RAM and you want fewer batch-boundary stalls.
     BATCH_SIZE = 32
 
+    def _iter_input_batches(batch_size: int):
+        """Yield list[dict] batches from either a parquet or JSONL input."""
+        if is_jsonl:
+            with args.data.open("r", encoding="utf-8") as f:
+                buf: list[dict] = []
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    buf.append(json.loads(line))
+                    if len(buf) >= batch_size:
+                        yield buf
+                        buf = []
+                if buf:
+                    yield buf
+        else:
+            for record_batch in pf.iter_batches(batch_size=batch_size, columns=cols):
+                yield record_batch.to_pylist()
+
     with args.output.open(mode, encoding="utf-8") as fout:
         with ThreadPoolExecutor(max_workers=args.max_concurrent) as pool:
             pbar = tqdm(total=n_target, desc=args.model)
             try:
-                for record_batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=cols):
-                    rows = record_batch.to_pylist()
+                for rows in _iter_input_batches(BATCH_SIZE):
                     # Honor --max_samples mid-stream.
                     if n_seen + len(rows) > n_target:
                         rows = rows[: n_target - n_seen]

@@ -152,7 +152,16 @@ def process_split(
     # table-build allocation. Writing one row at a time keeps peak RAM at
     # ~one row, fits an 8 GB workstation comfortably.
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = pq.ParquetWriter(out_path, SCHEMA, compression="zstd")
+    # Auto-pick the writer: .jsonl uses streaming line writes (zero buffer,
+    # safest on 8 GB Windows where the parquet path's 200 MB allocations can
+    # OOM); .parquet uses the standard columnar writer with zstd compression.
+    use_jsonl = out_path.suffix.lower() == ".jsonl"
+    if use_jsonl:
+        jsonl_handle = out_path.open("w", encoding="utf-8")
+        writer = None
+    else:
+        jsonl_handle = None
+        writer = pq.ParquetWriter(out_path, SCHEMA, compression="zstd")
 
     n_sessions = 0
     n_samples = 0
@@ -227,7 +236,12 @@ def process_split(
                 prompt_token_buckets.append(n_prompt)
 
             if len(batch) >= flush_every:
-                writer.write_table(pa.Table.from_pylist(batch, schema=SCHEMA))
+                if use_jsonl:
+                    for row in batch:
+                        jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    jsonl_handle.flush()
+                else:
+                    writer.write_table(pa.Table.from_pylist(batch, schema=SCHEMA))
                 batch.clear()
 
             if progress_every and n_sessions % progress_every == 0:
@@ -240,8 +254,15 @@ def process_split(
                 break
 
     if batch:
-        writer.write_table(pa.Table.from_pylist(batch, schema=SCHEMA))
-    writer.close()
+        if use_jsonl:
+            for row in batch:
+                jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        else:
+            writer.write_table(pa.Table.from_pylist(batch, schema=SCHEMA))
+    if use_jsonl:
+        jsonl_handle.close()
+    else:
+        writer.close()
 
     # Distribution percentiles for downstream truncation-policy decision.
     p50 = p90 = p99 = 0
@@ -302,6 +323,17 @@ def main() -> None:
              "raw prompts on 8 GB workstations). Downstream Gemini inference "
              "is unaffected because it uses its own tokenizer.",
     )
+    ap.add_argument(
+        "--out_format",
+        choices=["parquet", "jsonl"],
+        default="parquet",
+        help="parquet (default) uses pyarrow's columnar writer with zstd "
+             "compression — best for downstream training pipelines but the "
+             "200 MB-class allocations can OOM on 8 GB Windows. jsonl writes "
+             "one JSON object per line streaming — zero buffer, safest on "
+             "memory-constrained machines. eval/run_gemini_inference.py "
+             "auto-detects the input format from the file extension.",
+    )
     args = ap.parse_args()
 
     if args.no_tokenize:
@@ -325,7 +357,7 @@ def main() -> None:
         if not in_path.exists():
             print(f"[skip] {in_path} not found")
             continue
-        out_path = args.out_dir / f"{split}_raw.parquet"
+        out_path = args.out_dir / f"{split}_raw.{args.out_format}"
         print(f"[{split}] {in_path} -> {out_path}", flush=True)
         summary[split] = process_split(
             tokenizer, template, system_text,
