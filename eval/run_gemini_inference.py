@@ -361,6 +361,19 @@ def main() -> None:
         key = (row_dict.get("user_id"), row_dict.get("session_id"), row_dict.get("step_idx"))
         if key in seen:
             return None
+        # Raw render mode marks rows whose prompt couldn't even be built
+        # locally due to MemoryError. Record them as empty completions so
+        # the failure count is honest, without calling Gemini.
+        if row_dict.get("render_failed"):
+            return {
+                "user_id": row_dict.get("user_id"),
+                "session_id": row_dict.get("session_id"),
+                "step_idx": row_dict.get("step_idx"),
+                "completion": "",
+                "action_gt": row_dict.get("action_gt"),
+                "rationale_gt": row_dict.get("rationale_gt", ""),
+                "failure_reason": "local_render_oom",
+            }
         system, user = split_qwen_prompt(row_dict["prompt_text"])
         # Belt-and-suspenders: vertexai.init() ran in the main thread, but
         # constructing GenerativeModel inside a worker thread sometimes
@@ -379,6 +392,8 @@ def main() -> None:
             "completion": completion if completion is not None else "",
             "action_gt": row_dict.get("action_gt"),
         }
+        if completion is None:
+            out["failure_reason"] = "gemini_api"
         if "rationale_gt" in row_dict:
             out["rationale_gt"] = row_dict["rationale_gt"]
         if "is_session_last_step" in row_dict:
@@ -413,41 +428,21 @@ def main() -> None:
             + len(step.get("action_wire_json", ""))
         )
 
-    # Hard cap on the rendered prompt size in chars. Two reasons:
-    #   1. Gemini 2.5 / 3.5 Flash reject inputs over 1,048,576 tokens with
-    #      400 "input token count exceeds maximum" — we observed this on
-    #      late-session steps where history accumulates 1M+ HTML tokens.
-    #   2. Even before the API would reject, the local jinja render OOMs on
-    #      8 GB Windows once the rendered string and its intermediates push
-    #      past ~3 MB on a heap fragmented by hundreds of prior iterations.
-    # chars/4 ~ tokens is the standard heuristic for English-y text; OPeRA
-    # HTML runs a bit denser (chars/4 underestimates Gemini's count by 10-20%).
-    # Cap at 2.5 M chars to leave safe headroom on both axes.
-    RAW_RENDER_CHAR_BUDGET = 2_500_000
+    def _render_one_prompt(persona_json: str, history: list[dict], current_obs: str) -> Optional[str]:
+        """On-the-fly Qwen-templated prompt for a single step.
 
-    def _truncate_history_to_budget(history: list[dict], current_obs_chars: int) -> tuple[list[dict], int]:
-        """Drop oldest history steps until estimated total prompt chars fits
-        RAW_RENDER_CHAR_BUDGET. Returns (kept_history, n_dropped). Mirrors the
-        paper baseline's oldest-step-drop policy, but applied here on the raw
-        prompt to keep it inside Gemini's window and our local RAM budget."""
-        # Fixed-overhead estimate: system text + chat template wrapper + persona
-        # block + current observation. Persona is small; the rest are mostly
-        # the system text and the current obs.
-        SYSTEM_OVERHEAD_CHARS = len(system_text_raw) + 256  # template tags etc
-        base = SYSTEM_OVERHEAD_CHARS + current_obs_chars
-        sizes = [_step_chars(s) for s in history]
-        total = base + sum(sizes)
-        drop = 0
-        while total > RAW_RENDER_CHAR_BUDGET and drop < len(history):
-            total -= sizes[drop]
-            drop += 1
-        return history[drop:], drop
+        No truncation by design — the experiment intent is to observe Gemini's
+        own 1M-token limit as a measurement, not to mask it behind our own
+        truncation policy. The Gemini API returns 400 'input token count
+        exceeds maximum' for prompts above its limit, which the call_gemini_*
+        retry loop records as an empty completion.
 
-    def _render_one_prompt(persona_json: str, history: list[dict], current_obs: str) -> tuple[str, int]:
-        """On-the-fly Qwen-templated prompt for a single step. Memory-efficient
-        because we only hold one rendered string at a time and the caller drops
-        it after the API call returns. Returns (prompt_text, n_history_dropped)."""
-        history, n_dropped = _truncate_history_to_budget(history, len(current_obs))
+        Returns None when the local jinja render itself raises MemoryError
+        (prompt too big for the 8 GB workstation's free heap even before we
+        try to send it). In that case the row is recorded as a render failure
+        — distinct in spirit from a Gemini API failure since we never asked
+        the model, but for scorer purposes the completion is empty either way.
+        """
         history_render = [
             {
                 "observation": s["observation"],
@@ -456,20 +451,24 @@ def main() -> None:
             }
             for s in history
         ]
-        user_text = user_template.render(
-            persona_json=persona_json,
-            history=history_render,
-            current_observation=current_obs,
-        )
-        # Hand chat template (matches data/render_raw_for_gemini.py).
-        full = "".join((
-            "<|im_start|>system\n",
-            system_text_raw,
-            "<|im_end|>\n<|im_start|>user\n",
-            user_text,
-            "<|im_end|>\n<|im_start|>assistant\n",
-        ))
-        return full, n_dropped
+        try:
+            user_text = user_template.render(
+                persona_json=persona_json,
+                history=history_render,
+                current_observation=current_obs,
+            )
+            return "".join((
+                "<|im_start|>system\n",
+                system_text_raw,
+                "<|im_end|>\n<|im_start|>user\n",
+                user_text,
+                "<|im_end|>\n<|im_start|>assistant\n",
+            ))
+        except MemoryError:
+            sys.stderr.write(
+                f"[gemini] render MemoryError — skipping (prompt too big for local heap)\n"
+            )
+            return None
 
     def _iter_input_batches(batch_size: int):
         """Yield list[dict] batches from parquet, JSONL, or trajectories.
@@ -493,17 +492,20 @@ def main() -> None:
                     for t_idx in range(len(steps)):
                         history = steps[:t_idx]
                         current = steps[t_idx]
-                        prompt_text, n_dropped = _render_one_prompt(
+                        prompt_text = _render_one_prompt(
                             persona_json, history, current["observation"]
                         )
                         row = {
                             "user_id": user_id,
                             "session_id": session_id,
                             "step_idx": int(t_idx),
-                            "prompt_text": prompt_text,
+                            # prompt_text=None means the render OOM'd locally;
+                            # the worker treats it as an empty/failed row
+                            # without calling Gemini.
+                            "prompt_text": prompt_text if prompt_text is not None else "",
                             "action_gt": current["action_wire_json"],
                             "rationale_gt": _step_rationale(current),
-                            "n_history_dropped": n_dropped,
+                            "render_failed": prompt_text is None,
                         }
                         buf.append(row)
                         if len(buf) >= batch_size:
