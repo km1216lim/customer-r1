@@ -62,6 +62,13 @@ from tqdm import tqdm
 
 # Customer-R1 action wire format (paper Appendix B). Used as response_schema
 # to force Gemini's structured output to match what parse_model_output expects.
+# Key names follow paper Appendix B exactly — these are the keys that
+# data/action_schema.py:action_from_dict reads:
+#   click:     {"type":"click", "name":"<semantic_id>"}
+#   input:     {"type":"input", "name":"<semantic_id>", "text":"<input_text>"}
+#   terminate: {"type":"terminate"}
+# Using internal field names like `semantic_id` / `input_text` here would
+# cause the parser to find no slots and report FG-Type = NAG = 0.
 # `additional_properties=False` would be cleaner but Vertex's schema validator
 # is finicky about it across model versions — leave it permissive.
 ACTION_SCHEMA = {
@@ -79,17 +86,13 @@ ACTION_SCHEMA = {
                     "enum": ["click", "input", "terminate"],
                     "description": "The action verb."
                 },
-                "semantic_id": {
+                "name": {
                     "type": "string",
-                    "description": "Required for click/input. Element identifier from the observation."
+                    "description": "Required for click and input. Dotted semantic_id of the target element, copied verbatim from the observation HTML's name=\"...\" attribute (e.g. 'nav_bar.search_input', 'search_result.product_title')."
                 },
-                "click_type": {
+                "text": {
                     "type": "string",
-                    "description": "Sub-type for click actions (purchase, search, review, ...)."
-                },
-                "input_text": {
-                    "type": "string",
-                    "description": "Required for input actions. The text the user types."
+                    "description": "Required for input actions only. The exact text to type into the field identified by `name`."
                 }
             },
             "required": ["type"]
