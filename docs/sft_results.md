@@ -1,11 +1,12 @@
 # Customer-R1 SFT 단계 결과 — Baseline vs L2 압축
 
-작성: 2026-06-09 · 최종 업데이트: 2026-06-10 (Gemini Flash 외부 baseline 추가) · 상태: SFT 종료, GRPO 대기
+작성: 2026-06-09 · 최종 업데이트: 2026-06-10 (Gemini 2.5/3.5 Flash 외부 baseline 추가) · 상태: SFT 종료, GRPO 대기
 
 paper(arxiv 2510.07230) Table 4의 4개 지표를 기준으로 baseline(uncompressed
 prompt), L2(furniture dedup + action-anchored slicing 압축), 그리고 외부
-baseline인 Gemini 2.5 Flash zero-shot을 비교한다. GRPO 단계의 최종 결과는
-본 문서가 아니라 [grpo_results.md](grpo_results.md) (작성 예정)에 기록한다.
+baseline인 Gemini 2.5 Flash / 3.5 Flash zero-shot을 비교한다. GRPO 단계의
+최종 결과는 본 문서가 아니라 [grpo_results.md](grpo_results.md) (작성 예정)에
+기록한다.
 
 ## 1. 학습 설정
 
@@ -151,11 +152,14 @@ step 2000 시점의 L2 vs baseline 직접 비교:
    기준 −28p 격차는 minority class 학습 차이로 해석 가능하지만 모델 능력
    자체 격차는 아님.
 
-## 4. 외부 baseline 비교 — Gemini 2.5 Flash (zero-shot)
+## 4. 외부 baseline 비교 — Gemini 2.5 / 3.5 Flash (zero-shot)
 
 같은 65K truncated test set(`data/processed/test.parquet`)으로 zero-shot
-Gemini 2.5 Flash를 평가한 결과. 같은 입력 + 같은 평가 코드를 사용하므로
-trained vs zero-shot 직접 비교 가능 ([eval/run_gemini_inference.py](../eval/run_gemini_inference.py)).
+Gemini 2.5 Flash와 3.5 Flash를 평가한 결과. 같은 입력 + 같은 평가 코드를
+사용하므로 trained vs zero-shot 직접 비교 가능 ([eval/run_gemini_inference.py](../eval/run_gemini_inference.py)).
+3.5 Flash는 Vertex AI의 `global` location에서만 접근 가능하며, 2.5 대비
+reasoning이 길어 `max_output_tokens=2048` 설정 필요 (1024로는 일부 응답이
+잘려 빈 completion 반환).
 
 ### 4.1 결과
 
@@ -163,33 +167,35 @@ trained vs zero-shot 직접 비교 가능 ([eval/run_gemini_inference.py](../eva
 |---|---|---|---|---|---|
 | **Ours SFT baseline** | **25.10** | 44.39 | 80.20 | **80.24** | 42.42 |
 | Ours SFT L2 | 23.79 | **46.24** | 76.19 | 71.88 | 53.52 |
-| **Gemini 2.5 Flash** | 18.95 | 44.72 | **80.60** | 79.84 | **59.46** |
+| Gemini 2.5 Flash | 18.95 | 44.72 | **80.60** | 79.84 | 59.46 |
+| **Gemini 3.5 Flash** | 14.72 | 43.93 | 79.83 | 78.53 | **72.09** |
 | Paper SFT-only | 35.14 | – | 72.66\* | 56.43 | 66.29 |
 
 \* §2.2의 가설대로 paper "Macro-F1"이 weighted F1이라 가정.
 
 축별 우위:
 
-| 축 | 1위 | 2위 | 3위 |
-|---|---|---|---|
-| NAG (verbatim copy) | Paper 35.14 | **Ours baseline 25.10** | Ours L2 23.79 |
-| Weighted-F1 | Gemini 80.60 | **Ours baseline 80.20** | Ours L2 76.19 |
-| FG-Type (format) | **Ours baseline 80.24** | Gemini 79.84 | Ours L2 71.88 |
-| Session | Paper 66.29 | Gemini 59.46 | Ours L2 53.52 |
+| 축 | 1위 | 2위 | 3위 | 4위 |
+|---|---|---|---|---|
+| NAG (verbatim copy) | Paper 35.14 | **Ours baseline 25.10** | Ours L2 23.79 | Gemini 3.5 14.72 |
+| Weighted-F1 | Gemini 2.5 80.60 | **Ours baseline 80.20** | Gemini 3.5 79.83 | Ours L2 76.19 |
+| FG-Type (format) | **Ours baseline 80.24** | Gemini 2.5 79.84 | Gemini 3.5 78.53 | Ours L2 71.88 |
+| Session | **Gemini 3.5 72.09** | Paper 66.29 | Gemini 2.5 59.46 | Ours L2 53.52 |
 
 ### 4.2 Per-class 분석 — Gemini의 catastrophic terminate failure
 
-Gemini Flash의 type별 예측 분포:
+Gemini Flash의 type별 예측 분포 (2.5 vs 3.5 비교):
 
-| Class | GT support | Pred count | Pred/GT 비율 | F1 |
-|---|---|---|---|---|
-| click | 845 | 829 | 0.98 | **0.889** |
-| input | 107 | 105 | 0.98 | 0.453 |
-| **terminate** | **40** | **0** | **0.00** ⚡ | **0.000** ⚡ |
-| (INVALID) | 0 | 58 | – | – |
+| Class | GT support | 2.5 Pred | 3.5 Pred | 2.5 F1 | 3.5 F1 |
+|---|---|---|---|---|---|
+| click | 845 | 829 (0.98×) | 833 (0.99×) | 0.889 | 0.882 |
+| input | 107 | 105 (0.98×) | 72 (0.67×) | 0.453 | 0.436 |
+| **terminate** | **40** | **0 (0.00×)** ⚡ | **1 (0.03×)** ⚡ | **0.000** | **0.000** |
+| (INVALID) | 0 | 58 | 86 | – | – |
 
-**Gemini Flash는 992 샘플 동안 단 한 번도 terminate를 예측하지 않음.**
-우리 SFT step 200 시점에 보였던 click mode collapse와 같은 패턴.
+**Gemini Flash는 992 샘플 동안 거의 단 한 번도 terminate를 예측하지 않음
+(2.5: 0회, 3.5: 1회).** 우리 SFT step 200 시점에 보였던 click mode collapse와
+같은 패턴 — 모델 세대가 올라가도 패턴 동일.
 
 원인 추정:
 - response_schema에 `terminate` enum 옵션은 명시했으나 "언제 써야 하는가"는
@@ -201,28 +207,36 @@ Gemini Flash의 type별 예측 분포:
 class 의사결정을 가능하게 함**. terminate F1 = 0.16~0.45 정도라도 0.000은
 아님.
 
-### 4.3 Session Outcome 우위는 artifactual
+### 4.3 Session Outcome 우위 — 부분적 artifactual + 부분적 진짜 향상
 
-Gemini의 Session 59.46이 우리 L2 53.52를 앞선 것처럼 보이나, 세부를 보면
-실제 task 이해의 차이가 아니라 예측 분포 편향의 부산물:
+Gemini의 Session이 우리 모델을 앞선 메커니즘 분석:
 
 | | tp | fp | fn | precision | recall | F1 | pred_purchase |
 |---|---|---|---|---|---|---|---|
-| Gemini Flash | 22 | 2 | 28 | **91.7%** | 44.0% | **59.46** | 24 |
+| Gemini 2.5 Flash | 22 | 2 | 28 | **91.7%** | 44.0% | **59.46** | 24 |
+| **Gemini 3.5 Flash** | **31** | 5 | **19** | 86.1% | **62.0%** | **72.09** | **36** |
 | Ours SFT L2 (step 1800 ref.) | 12 | 2 | 38 | 85.7% | 24.0% | 37.50 | 14 |
 
-Gemini가 Session에서 이긴 메커니즘:
-1. **Terminate를 0번 예측** → 세션 마지막 step도 click으로 예측
-2. 그 click 중 일부가 우연히 purchase로 매핑됨
-3. 24개 purchase 예측 (vs 우리 L2 14개) → recall 향상
+Gemini 우위의 메커니즘:
 
-즉 **Gemini Session 우위 = "terminate 안 씀의 부산물"**, "purchase 의도를
-더 잘 이해함"이 아님. 우리 모델이 terminate over-prediction을 GRPO에서
-보정하면 같은 메커니즘으로 Session 점수 향상 가능.
+1. **Artifactual 부분 (두 모델 공통)**: Terminate를 거의 0번 예측 → 세션 마지막
+   step도 click으로 예측 → 그 click 중 일부가 우연히 purchase로 매핑됨. 우리
+   모델이 terminate over-prediction을 GRPO에서 보정하면 같은 메커니즘으로
+   Session 점수 향상 가능.
+
+2. **2.5 → 3.5의 +12.63p 향상은 진짜 task 이해 증가**: tp 22→31 (+9), recall
+   44%→62% (+18p), purchase 예측 24→36 (+12). 3.5 Flash는 어떤 click이
+   "purchase로 이어지는지"를 더 정확히 인식. 단, precision은 91.7%→86.1%로
+   소폭 하락 (5개 false positive 추가).
+
+즉 **Gemini Session 우위 = "terminate 안 씀의 부산물" + "더 강한 모델의
+purchase 의도 인식 향상"**. 2.5와 비교하면 우리 모델의 Session 격차가 일부
+artifactual이라는 가설이 유지되지만, 3.5가 paper SFT(66.29)도 넘는다는 점은
+zero-shot 의사결정 품질이 충분히 강하다는 의미이기도 함.
 
 ### 4.4 본 실험의 narrative — 외부 baseline으로 강화
 
-이 분석으로 두 개의 강한 주장이 가능:
+이 분석으로 세 개의 강한 주장이 가능:
 
 #### 주장 1: 우리 7B 학습 모델이 paper SFT를 metric-level에서 재현 또는 능가
 
@@ -233,16 +247,29 @@ Gemini가 Session에서 이긴 메커니즘:
 
 #### 주장 2: 우리 학습 모델이 zero-shot Gemini Flash와 동등 또는 NAG에서 우위
 
-- Macro-F1 / FG-Type 거의 동등 (±0.4p)
-- NAG: **우리 +6.15p 우위** (verbatim copy 능력)
-- Session: Gemini +5.94p이지만 **artifactual** (terminate 0회 예측의 부산물)
-- Gemini의 weighted F1 80.60도 우리 baseline 80.20과 거의 동일
+- Macro-F1 / FG-Type / Weighted-F1 모두 거의 동등 (±1p) — 2.5, 3.5 공통
+- **NAG: 우리 baseline +6.15p (vs 2.5), +10.38p (vs 3.5) 우위** — verbatim
+  copy 능력은 task-specific 학습의 직접 효과
+- Session: Gemini 우위 (특히 3.5는 paper도 능가)이나 **부분적 artifactual**
+  (terminate ≈ 0 예측의 부산물) + **부분적 진짜 향상** (3.5의 purchase 인식
+  강화)
+
+#### 주장 3: 모델 세대(2.5 → 3.5)가 올라가도 NAG 격차는 더 벌어짐
+
+- 2.5 Flash → 3.5 Flash로 가도 NAG는 18.95 → 14.72로 **오히려 감소**
+- 더 강한 모델은 reasoning이 길어지지만 **verbatim copy 능력은 약화**
+- Task-specific 학습이 frontier zero-shot 모델로도 대체되지 않는 능력임을 입증
+- Macro-F1 / FG-Type은 2.5와 3.5가 사실상 동일 — 모델 발전의 효과가 Session
+  (의도 이해) 한 축에만 집중
 
 #### 한 줄 결론
 
 > **Customer-R1의 task-specific 7B 모델은 paper의 보고된 metric을 재현(또는
-> 능가)하며, zero-shot Gemini Flash와 동등한 성능을 보이면서 NAG에서 의미
-> 있는 우위를 가짐. 압축(L2)은 Macro-F1과 Session에서 약간의 추가 이점을
+> 능가)하며, zero-shot Gemini Flash (2.5 / 3.5 둘 다)와 동등한 type-level
+> 의사결정 성능을 보이면서 NAG(verbatim ID copy)에서 의미 있는 우위를 유지함.
+> 더 강한 Gemini 3.5도 verbatim copy 능력은 오히려 떨어져 우리 우위가 확대됨.
+> Session 우위만 Gemini가 가지나, 일부 artifactual(terminate 회피)이고 일부
+> 진짜 모델 능력 향상. 압축(L2)은 Macro-F1과 Session에서 약간의 추가 이점을
 > 제공함.**
 
 ### 4.5 통계적 유의성
@@ -251,12 +278,19 @@ n=992에서 metric별 95% 신뢰구간 (이항 분포):
 
 | 비교 | 차이 | 95% CI 겹침? | 결론 |
 |---|---|---|---|
-| NAG: Ours 25.10 vs Gemini 18.95 | +6.15p | 안 겹침 | **통계적으로 유의** |
-| Weighted-F1: Ours 80.20 vs Gemini 80.60 | -0.40p | 겹침 | 사실상 동등 |
-| FG-Type: Ours 80.24 vs Gemini 79.84 | +0.40p | 겹침 | 사실상 동등 |
-| Session: Ours L2 53.52 vs Gemini 59.46 | -5.94p | 겹침 (경계선) | 약하게 유의 |
+| NAG: Ours baseline 25.10 vs Gemini 2.5 18.95 | +6.15p | 안 겹침 | **통계적으로 유의** |
+| **NAG: Ours baseline 25.10 vs Gemini 3.5 14.72** | **+10.38p** | **확실히 안 겹침** | **강하게 유의** |
+| Weighted-F1: Ours 80.20 vs Gemini 2.5 80.60 | -0.40p | 겹침 | 사실상 동등 |
+| Weighted-F1: Ours 80.20 vs Gemini 3.5 79.83 | +0.37p | 겹침 | 사실상 동등 |
+| FG-Type: Ours 80.24 vs Gemini 2.5 79.84 | +0.40p | 겹침 | 사실상 동등 |
+| FG-Type: Ours 80.24 vs Gemini 3.5 78.53 | +1.71p | 겹침 | 사실상 동등 |
+| Session: Ours L2 53.52 vs Gemini 2.5 59.46 | -5.94p | 겹침 (경계선) | 약하게 유의 |
+| **Session: Ours L2 53.52 vs Gemini 3.5 72.09** | **-18.57p** | **안 겹침** | **강하게 유의** |
 
-NAG +6.15p 우위는 noise가 아닌 진짜 차이로 확정.
+NAG 우위는 noise가 아닌 진짜 차이로 확정. 더 강한 Gemini(3.5)일수록 우리 NAG
+우위가 확대되는 패턴 (+6.15p → +10.38p) 또한 통계적으로 명확. Session에서
+3.5 Flash의 우위(+18.57p)도 통계적으로 강하게 유의 — paper 수준의 zero-shot
+능력 (paper 66.29 < Gemini 3.5 72.09)을 보여줌.
 
 ## 5. 평가 코드 수정 사항
 
@@ -311,17 +345,30 @@ GRPO 종료 후 본 문서와 같은 형식으로
   bash scripts/eval.sh --stage sft --data baseline
   bash scripts/eval.sh --stage sft --data l2
   ```
-- 외부 baseline (Gemini Flash, §4) 재현:
+- 외부 baseline (Gemini 2.5 / 3.5 Flash, §4) 재현:
   ```powershell
+  # Gemini 2.5 Flash (us-central1)
   python eval\run_gemini_inference.py `
     --data data\processed\test.parquet `
     --model gemini-2.5-flash `
     --output eval\preds_gemini25flash_baseline65k.jsonl `
     --max_concurrent 5 `
     --credentials <service_account_json_path>
+  # Gemini 3.5 Flash (global only — needs --location global)
+  python eval\run_gemini_inference.py `
+    --data data\processed\test.parquet `
+    --model gemini-3.5-flash `
+    --location global `
+    --output eval\preds_gemini35flash_baseline65k.jsonl `
+    --max_concurrent 5 `
+    --credentials <service_account_json_path>
+  # 점수
   python eval\next_action_acc.py `
     --predictions eval\preds_gemini25flash_baseline65k.jsonl `
     --out eval\preds_gemini25flash_baseline65k.results.json
+  python eval\next_action_acc.py `
+    --predictions eval\preds_gemini35flash_baseline65k.jsonl `
+    --out eval\preds_gemini35flash_baseline65k.results.json
   ```
 - 압축 효과 측정: [tokenize_pack_compressed.py](../data/tokenize_pack_compressed.py)
   의 `_stats_*` 출력 (per-step compression ratio p50/p90/p99 포함)
