@@ -84,7 +84,26 @@ def _render_user(template: Template, persona_json: str, history_render: list[dic
     )
 
 
+_QWEN_CHAT_TEMPLATE = (
+    "<|im_start|>system\n{system}<|im_end|>\n"
+    "<|im_start|>user\n{user}<|im_end|>\n"
+    "<|im_start|>assistant\n"
+)
+
+
 def _chat_template_text(tokenizer, system_text: str, user_text: str) -> str:
+    """Apply the Qwen2.5 chat template.
+
+    When `tokenizer` is None (memory-constrained mode), we hand-render the
+    same template format. This avoids loading the Qwen tokenizer (which
+    requires downloading from huggingface.co — fails behind corp proxies —
+    and tokenizing 1M+ char prompts blows up RAM on 8 GB workstations).
+    The downstream consumer is Gemini, which uses its own tokenizer, so
+    the only consequence of the hand template is that we can't compute
+    Qwen-token counts.
+    """
+    if tokenizer is None:
+        return _QWEN_CHAT_TEMPLATE.format(system=system_text, user=user_text)
     return tokenizer.apply_chat_template(
         [{"role": "system", "content": system_text},
          {"role": "user",   "content": user_text}],
@@ -94,6 +113,15 @@ def _chat_template_text(tokenizer, system_text: str, user_text: str) -> str:
 
 
 def _token_len(tokenizer, text: str) -> int:
+    """Token count. Falls back to chars/4 heuristic when tokenizer is None.
+
+    chars/4 is the standard rough estimate for English-text token count and
+    works well enough for the "does this prompt fit in Gemini's 1M context"
+    decision — Gemini uses its own tokenizer anyway, so the Qwen count was
+    only ever a proxy.
+    """
+    if tokenizer is None:
+        return max(1, len(text) // 4)
     return len(tokenizer(text, add_special_tokens=False).input_ids)
 
 
@@ -256,15 +284,28 @@ def main() -> None:
         default=None,
         help="Cap sessions per split (debugging).",
     )
+    ap.add_argument(
+        "--no_tokenize",
+        action="store_true",
+        help="Skip loading the Qwen tokenizer. Use a chars/4 heuristic for "
+             "token counts and a hand-built chat template for prompt rendering. "
+             "Required on machines without huggingface.co access (corp proxy) "
+             "or with limited RAM (the Qwen tokenizer chokes on the 1M+ char "
+             "raw prompts on 8 GB workstations). Downstream Gemini inference "
+             "is unaffected because it uses its own tokenizer.",
+    )
     args = ap.parse_args()
 
-    try:
-        from transformers import AutoTokenizer
-    except ImportError:
-        sys.exit("pip install 'transformers>=4.45' to use this script")
-
-    print(f"[tok] loading {args.tokenizer} ...", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+    if args.no_tokenize:
+        print("[tok] --no_tokenize set: using hand chat template + chars/4 token estimate", flush=True)
+        tokenizer = None
+    else:
+        try:
+            from transformers import AutoTokenizer
+        except ImportError:
+            sys.exit("pip install 'transformers>=4.45' to use this script (or pass --no_tokenize)")
+        print(f"[tok] loading {args.tokenizer} ...", flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
 
     system_text = args.system_prompt.read_text(encoding="utf-8")
     template = Template(args.user_template.read_text(encoding="utf-8"))
