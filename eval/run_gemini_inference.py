@@ -211,6 +211,12 @@ def main() -> None:
                          "GOOGLE_APPLICATION_CREDENTIALS for this process.")
     ap.add_argument("--location", default="us-central1",
                     help="Vertex AI region. Default: us-central1.")
+    ap.add_argument("--project",
+                    help="GCP project ID. If omitted, read from the service "
+                         "account JSON's `project_id` field. Threaded callers "
+                         "need this explicit because vertexai's lazy autodetect "
+                         "fails when GenerativeModel() is constructed off the "
+                         "main thread.")
     ap.add_argument("--max_concurrent", type=int, default=5,
                     help="Concurrent API calls. Keep ≤ 5-8 to avoid rate limits.")
     ap.add_argument("--max_output_tokens", type=int, default=1024,
@@ -230,11 +236,24 @@ def main() -> None:
         sys.exit("[gemini] GOOGLE_APPLICATION_CREDENTIALS not set. "
                  "Pass --credentials PATH or export it in the shell.")
 
+    # Resolve the GCP project. The service-account JSON has it as `project_id`.
+    project = args.project
+    if not project:
+        cred_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+        try:
+            with open(cred_path, "r", encoding="utf-8") as f:
+                project = json.load(f).get("project_id")
+        except Exception as e:  # noqa: BLE001
+            sys.exit(f"[gemini] could not read project_id from {cred_path}: {e}")
+        if not project:
+            sys.exit("[gemini] credentials JSON has no project_id field — pass --project.")
+    print(f"[gemini] project={project} location={args.location} model={args.model}")
+
     # Import here so --help works without the SDK installed.
     import vertexai
     from vertexai.generative_models import GenerativeModel, GenerationConfig
 
-    vertexai.init(location=args.location)
+    vertexai.init(project=project, location=args.location)
 
     # The task instructions in the parquet's prompt are bundled into the
     # `<|im_start|>system` segment that we strip out per-row in split_qwen_prompt.
@@ -288,6 +307,11 @@ def main() -> None:
         if key in seen:
             return None
         system, user = split_qwen_prompt(row_dict["prompt_text"])
+        # Belt-and-suspenders: vertexai.init() ran in the main thread, but
+        # constructing GenerativeModel inside a worker thread sometimes
+        # re-triggers project autodetection and fails. Re-init here to make
+        # sure the project/location are bound for THIS thread's SDK state.
+        vertexai.init(project=project, location=args.location)
         model = GenerativeModel(
             args.model,
             system_instruction=system if system else None,
