@@ -222,8 +222,11 @@ def main() -> None:
                          "main thread.")
     ap.add_argument("--max_concurrent", type=int, default=5,
                     help="Concurrent API calls. Keep ≤ 5-8 to avoid rate limits.")
-    ap.add_argument("--max_output_tokens", type=int, default=1024,
-                    help="Cap on response length. 1024 fits a JSON action comfortably.")
+    ap.add_argument("--max_output_tokens", type=int, default=2048,
+                    help="Cap on response length. 2048 is safe across Gemini 2.5 / 3.5 "
+                         "Flash — the older 1024 default was sometimes exceeded by "
+                         "3.5's longer rationales, producing empty completions when the "
+                         "partial JSON failed response_schema validation.")
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="Greedy by default for reproducibility.")
     ap.add_argument("--max_samples", type=int, default=None,
