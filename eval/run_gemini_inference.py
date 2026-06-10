@@ -310,18 +310,13 @@ def main() -> None:
             sys.exit(f"[gemini] user template not found: {args.user_template}")
         system_text_raw = args.system_prompt.read_text(encoding="utf-8")
         user_template = Template(args.user_template.read_text(encoding="utf-8"))
-        # Pre-count total rows for the progress bar (cheap — one scan, only sums
-        # steps without reading observation HTML into memory).
-        total_rows = 0
-        with args.traj_jsonl.open("r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    sess = json.loads(line)
-                    total_rows += len(sess.get("steps", []))
-                except json.JSONDecodeError:
-                    continue
+        # Skip the pre-count entirely. Each line of trajectories_synth/test.jsonl
+        # is one full session with all its observation HTML — that can be 15+ MB
+        # for the largest sessions, and just iterating `for line in f` raises
+        # MemoryError on an 8 GB workstation when the heap is fragmented by
+        # other apps. The progress bar runs without a percentage; we still know
+        # we're done when the iterator stops.
+        total_rows = None
         cols = ["traj_jsonl (raw render)"]
     else:
         if args.data is None:
@@ -340,9 +335,19 @@ def main() -> None:
                 sys.exit(f"[gemini] parquet {args.data} missing required columns: {missing_required}")
             total_rows = pf.metadata.num_rows
 
-    n_target = min(total_rows, args.max_samples) if args.max_samples is not None else total_rows
+    # n_target=None means "stream until the input is exhausted" — used in raw
+    # render mode where total_rows is None to avoid the pre-count OOM.
+    if args.max_samples is not None and total_rows is not None:
+        n_target = min(total_rows, args.max_samples)
+    elif args.max_samples is not None:
+        n_target = args.max_samples
+    else:
+        n_target = total_rows  # may be None
     src = args.traj_jsonl if args.traj_jsonl is not None else args.data
-    print(f"[gemini] streaming {n_target}/{total_rows} rows from {src} (cols={cols})")
+    if n_target is None:
+        print(f"[gemini] streaming (unknown total) rows from {src} (cols={cols})")
+    else:
+        print(f"[gemini] streaming {n_target}/{total_rows} rows from {src} (cols={cols})")
 
     # --- resume / skip-existing ------------------------------------------
     seen: set[tuple] = set()
@@ -478,13 +483,32 @@ def main() -> None:
         """
         if args.traj_jsonl is not None:
             # Raw render mode: stream sessions, render per-step prompts on demand.
+            # Each line of trajectories_synth/test.jsonl can be 1.6-15 MB. We
+            # wrap the line read + json.loads in try/except so a single huge
+            # session that OOMs the parser doesn't kill the whole run — we
+            # log it and move on.
             with args.traj_jsonl.open("r", encoding="utf-8") as f:
                 buf: list[dict] = []
-                for line in f:
+                while True:
+                    try:
+                        line = f.readline()
+                    except MemoryError:
+                        sys.stderr.write(
+                            "[gemini] line read MemoryError — skipping (session too big for local heap)\n"
+                        )
+                        continue
+                    if not line:
+                        break
                     line = line.strip()
                     if not line:
                         continue
-                    session = json.loads(line)
+                    try:
+                        session = json.loads(line)
+                    except (MemoryError, json.JSONDecodeError) as e:
+                        sys.stderr.write(
+                            f"[gemini] session parse failed ({type(e).__name__}) — skipping\n"
+                        )
+                        continue
                     persona_json = json.dumps(session.get("persona", {}), ensure_ascii=False)
                     steps = session["steps"]
                     user_id = session.get("user_id", "")
@@ -543,8 +567,9 @@ def main() -> None:
             pbar = tqdm(total=n_target, desc=args.model)
             try:
                 for rows in _iter_input_batches(BATCH_SIZE):
-                    # Honor --max_samples mid-stream.
-                    if n_seen + len(rows) > n_target:
+                    # Honor --max_samples mid-stream. n_target=None means
+                    # "stream until input exhausted" (raw render mode).
+                    if n_target is not None and n_seen + len(rows) > n_target:
                         rows = rows[: n_target - n_seen]
                     n_seen += len(rows)
                     if not rows:
@@ -568,7 +593,7 @@ def main() -> None:
                         if not result["completion"]:
                             n_failed += 1
 
-                    if n_seen >= n_target:
+                    if n_target is not None and n_seen >= n_target:
                         break
             finally:
                 pbar.close()
