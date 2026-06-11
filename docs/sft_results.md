@@ -399,32 +399,43 @@ succeed-only subset의 type별 F1 (n=634):
 **Frontier 모델의 long context strength가 실용 환경에서는 36% 거부로 크게
 상쇄됨**. 우리 모델은 100% 처리 + 65K 기준 metric으로 안정적.
 
-#### 4.6.6 종합 표 — 모든 비교 (Weighted-F1 기준)
+#### 4.6.6 종합 표 — 모든 비교 (Macro-F1 + Weighted-F1)
 
-| Model | Context | 처리율 | NAG | Weighted-F1 | FG-Type | Session |
-|---|---|---|---|---|---|---|
-| Paper SFT-only | – | – | **35.14** | 72.66\* | 56.43 | 66.29 |
-| Ours SFT baseline | 65K trunc | 100% | 25.10 | 80.20 | 80.24 | 42.42 |
-| Ours SFT L2 | 65K compr | 100% | 23.79 | 76.19 | 71.88 | 53.52 |
-| Gemini 2.5 Flash | 65K trunc | 100% | 18.95 | 80.60 | 79.84 | 59.46 |
-| Gemini 3.5 Flash @ 65K | 65K trunc | 100% | 14.72 | 79.83 | 78.53 | **72.09** |
-| Gemini 3.5 Flash @ raw (as-is) | 1M raw | 64% | 10.69 | 65.94 | 55.04 | 56.76 |
-| Gemini 3.5 Flash @ raw (succeed) | 1M raw | **64%** | 16.72 | **83.98** | **86.12** | 66.67 |
+§2.2의 metric 정의 가설을 따라 두 가지 F1 평균 모두 함께 보고:
 
-\* §2.2의 가설대로 paper "Macro-F1"이 weighted F1이라 가정.
+| Model | Context | 처리율 | NAG | sklearn Macro-F1 | Weighted-F1 | FG-Type | Session |
+|---|---|---|---|---|---|---|---|
+| Paper SFT-only | – | – | **35.14** | – | 72.66\* | 56.43 | 66.29 |
+| Ours SFT baseline | 65K trunc | 100% | 25.10 | 44.39 | 80.20 | 80.24 | 42.42 |
+| Ours SFT L2 | 65K compr | 100% | 23.79 | 46.24 | 76.19 | 71.88 | 53.52 |
+| Gemini 2.5 Flash | 65K trunc | 100% | 18.95 | 44.72 | 80.60 | 79.84 | 59.46 |
+| Gemini 3.5 Flash @ 65K | 65K trunc | 100% | 14.72 | 43.93 | 79.83 | 78.53 | **72.09** |
+| Gemini 3.5 Flash @ raw (as-is) | 1M raw | 64% | 10.69 | 38.28 | 65.94 | 55.04 | 56.76 |
+| Gemini 3.5 Flash @ raw (succeed) | 1M raw | **64%** | 16.72 | **48.26** | **83.98** | **86.12** | 66.67 |
+
+\* §2.2의 가설대로 paper "Macro-F1" 보고치는 sklearn weighted-F1과 수치가
+일치 — 실제로는 weighted를 보고했을 가능성이 높음. 진짜 sklearn macro 값은
+paper에 없어 비교 불가.
 
 축별 1위:
 
 | 축 | 1위 | 비고 |
 |---|---|---|
 | NAG | Paper 35.14 | trained model이 우월. Frontier zero-shot 못 따라옴 |
+| sklearn Macro-F1 | Gemini 3.5 Flash @ raw succeed 48.26 | 같은 단서 — 64%만 처리 가능 |
 | **Weighted-F1** | **Gemini 3.5 Flash @ raw succeed 83.98** | **단 64%만 처리 가능 — 실용성 ↓** |
 | **FG-Type** | **Gemini 3.5 Flash @ raw succeed 86.12** | **단 64%만 처리 가능 — 실용성 ↓** |
 | Session | Gemini 3.5 Flash @ 65K 72.09 | 100% 처리 + 최고 Session |
 
-상위 4개 row의 Weighted-F1이 모두 76-84% 구간에 밀집 — **우리 trained 모델과
-zero-shot Gemini Flash들이 type-level 의사결정에서 거의 동등** (paper 72.66도
-같은 구간).
+두 F1 평균이 다른 정보를 줌:
+
+- **sklearn Macro-F1** (동등 가중 평균): 모든 trained / zero-shot 모델 38-48%
+  구간 — minority class(terminate) F1=0의 직접 영향. Class 균형 잡힌
+  의사결정 성능. paper에 별도 보고된 macro 값이 없어 paper 비교 불가.
+- **Weighted-F1** (support 가중 평균): 76-84% 구간 밀집 — click이 85%를
+  차지하니 click F1이 평균을 지배. paper "Macro-F1" 보고치(72.66)와 같은
+  자릿수라 paper 비교용. 우리 trained 모델과 zero-shot Gemini Flash들이
+  type-level 의사결정에서 거의 동등하게 위치.
 
 #### 4.6.7 본 실험 narrative의 raw 실험 강화 포인트
 
