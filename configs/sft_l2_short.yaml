@@ -1,0 +1,54 @@
+stage: sft
+
+# Short-schedule variant of sft_l2.yaml for the "sweet spot" sub-experiment
+# (docs/sft_results.md §5.5 hypothesis): the original sft_l2 run's 2000-step
+# cosine schedule over OPeRA-filtered (76 step/epoch = 26 epochs) appears to
+# overtrain on the small dataset — earlier accidental 304-step runs hit
+# higher NAG / FG-Type than the full 2000-step ckpt. This config tests
+# whether 400 steps with a compressed cosine schedule reaches the same or
+# better metrics with ~5x less compute.
+#
+# Schedule design:
+#   - total_steps 2000 -> 400 (1/5)
+#   - warmup_steps proportional: 150 / 2000 = 7.5 % -> 30 steps
+#   - save_every_n_steps 200: produces exactly 2 ckpts (step 200 + step 400)
+#   - same lr, weight_decay, batch_size, optimizer as paper
+#   - effective batch on 4 GPU (4_7b topology: dp=1, micro=1, grad_accum=16)
+#     equals 16, identical to 8 GPU (dp=2, grad_accum=8) — gradient signal
+#     per "step" is the same, only wall-time per step differs.
+#
+# Distinct run_name_prefix (sft-l2-short) so ckpts land in ckpt/sft-l2-short/
+# without clobbering the existing ckpt/sft-l2/global_step_2000 reference run.
+
+data:
+  # Layer-2 (action-anchored history slicing). Same parquet as sft_l2.yaml.
+  train_path: data/processed_L2/train.parquet
+  val_path: data/processed_L2/test.parquet
+  packed: true
+  bucket_lengths: [8192, 16384, 32768, 65536]
+
+optim:
+  lr: 1.0e-5
+  weight_decay: 0.0
+  warmup_steps: 30
+  lr_scheduler: cosine
+  optimizer: adamw_torch
+  max_grad_norm: 1.0
+
+train:
+  total_steps: 400
+  batch_size: 64
+  save_every_n_steps: 200
+  eval_every_n_steps: 200
+  log_every_n_steps: 10
+  seed: 42
+
+checkpoint:
+  save_format: hf_safetensors
+  save_optimizer_state: true
+  resume_from: null
+
+logging:
+  project: customer-r1
+  run_name_prefix: sft-l2-short
+  use_wandb: false

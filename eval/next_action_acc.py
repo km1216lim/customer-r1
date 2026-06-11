@@ -327,11 +327,28 @@ def main() -> None:
             [r.get("rationale_gt") for r in rows],
         )
 
+    # --- weighted F1 (paper hypothesis) -------------------------------------
+    # Paper reports "Macro-F1" but the published number aligns much more closely
+    # with a support-weighted F1 (see docs/sft_results.md §2.2). Report both
+    # so we can do an apples-to-apples comparison either way: sklearn macro
+    # for class-balanced quality, weighted-F1 for the paper-comparable number.
+    type_total_support = sum(type_f1_breakdown.get(c, {}).get("support_gt", 0) for c in ACTION_TYPES)
+    if type_total_support > 0:
+        weighted_f1_val = sum(
+            type_f1_breakdown.get(c, {}).get("support_gt", 0) * type_f1_breakdown.get(c, {}).get("f1", 0.0)
+            for c in ACTION_TYPES
+        ) / type_total_support
+    else:
+        weighted_f1_val = 0.0
+
     # --- table 4 summary -----------------------------------------------------
-    # Labels and ordering match the paper's Table 4 exactly.
+    # Labels and ordering match the paper's Table 4. We also expose
+    # "Action Type (Weighted-F1)" alongside the Macro-F1 row — it matches
+    # paper's reported value much more closely than sklearn macro.
     table4 = {
         "Next Action Gen.":          step_acc["nag"] / n,
         "Action Type (Macro-F1)":    macro_f1_val,
+        "Action Type (Weighted-F1)": weighted_f1_val,
         "Fine-grained Type":         step_acc["fg_type_acc"] / n,
         "Session Outcome":           so_f1,
     }

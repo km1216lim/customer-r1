@@ -1,0 +1,42 @@
+stage: sft
+
+# Short-schedule variant of sft_base.yaml for the "sweet spot" sub-experiment.
+# Same design as sft_l2_short.yaml — see that file's header for the rationale.
+# Pair runs:
+#   bash scripts/launch.sh --gpus 4 --model 7b --stage sft --data l2_short
+#   bash scripts/launch.sh --gpus 4 --model 7b --stage sft --data baseline_short
+# Distinct run_name_prefix (sft-baseline-short) so ckpts land in
+# ckpt/sft-baseline-short/ without clobbering the existing ckpt/sft/global_step_2000.
+
+data:
+  # Paper baseline: oldest-step-drop truncation in tokenize_pack.py.
+  train_path: data/processed/train.parquet
+  val_path: data/processed/test.parquet
+  packed: true
+  bucket_lengths: [8192, 16384, 32768, 65536]
+
+optim:
+  lr: 1.0e-5
+  weight_decay: 0.0
+  warmup_steps: 30
+  lr_scheduler: cosine
+  optimizer: adamw_torch
+  max_grad_norm: 1.0
+
+train:
+  total_steps: 400
+  batch_size: 64
+  save_every_n_steps: 200
+  eval_every_n_steps: 200
+  log_every_n_steps: 10
+  seed: 42
+
+checkpoint:
+  save_format: hf_safetensors
+  save_optimizer_state: true
+  resume_from: null
+
+logging:
+  project: customer-r1
+  run_name_prefix: sft-baseline-short
+  use_wandb: false
